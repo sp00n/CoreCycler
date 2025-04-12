@@ -748,7 +748,7 @@ enableAutomaticAdjustment = 0
 # The starting Curve Optimizer / voltage offset values
 # You can provide the Curve Optimizer / voltage offset starting values here, or let them be automatically detected
 # If you specify values here, they will overwrite your currently applied CO / voltage offset settings
-# If you leave the value blank or at "Default", it will try to automatically detect your current settings
+# If you leave the value blank or set it to "CurrentValues" or "Default", it will try to automatically detect your current settings
 #
 # For Ryzen, you can use the "Minimum" value to automatically set the values to their respective minimum Curve Optimizer values
 # (-30 for Ryzen 5000 and -50 for Ryzen 7000 and upwards)
@@ -783,8 +783,8 @@ enableAutomaticAdjustment = 0
 # Example to assign a voltage offset of -0.120v (-120mv) for Intel processors:
 # startValues = -120
 #
-# Default: Default
-startValues = Default
+# Default: CurrentValues
+startValues = CurrentValues
 
 
 # The upper limit for the Curve Optimizer values / voltage offset
@@ -5069,7 +5069,7 @@ function Initialize-AutomaticTestMode {
 
 
     # An empty value or "default" should use the currently assigned voltage values, so get them
-    if ($voltageStartValuesArray.Count -eq 0 -or $voltageStartValuesArray[0].ToString().ToLowerInvariant() -eq 'default') {
+    if ($voltageStartValuesArray.Count -eq 0 -or $voltageStartValuesArray[0].ToString().ToLowerInvariant() -eq 'default' -or $voltageStartValuesArray[0].ToString().ToLowerInvariant() -eq 'currentvalues') {
         if ($isIntelProcessor) {
             # Get the currently applied Intel voltage offset values
             $voltageStartValuesArray = Get-IntelVoltageOffset
