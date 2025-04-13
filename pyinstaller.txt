@@ -1,0 +1,8 @@
+pyinstaller -F -w --add-data "icon.ico;." --icon=icon.ico -n CoreCycler main.py
+
+-F: Creates a single executable file.
+-w: Hides the console window, making it suitable for GUI applications.
+--add-data "icon.ico;.": Bundles the CC.png file with the executable, placing it in the same directory.
+--icon=icon.ico: Sets the application icon to icon.ico.
+main.py: The main Python script being packaged.
+CoreCycler: Names the executable
