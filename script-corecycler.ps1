@@ -2,7 +2,7 @@
 .AUTHOR
     sp00n
 .VERSION
-    0.11.0.0alpha1
+    0.11.0.0alpha2
 .DESCRIPTION
     Sets the affinity of the selected stress test program process to only one
     core and cycles through all the cores which allows to test the stability of
@@ -23,7 +23,7 @@ param(
 
 
 # Our current version
-$version = '0.11.0.0alpha1'
+$version = '0.11.0.0alpha2'
 
 
 # This defines the strict mode
@@ -5933,12 +5933,22 @@ function Get-StressTestProcessInformation {
     Write-VerboseText('Found the following window(s) with these names:')
 
     $windowObj | ForEach-Object {
-        $path = (Get-Process -Id $_.ProcessId -ErrorAction Ignore).Path
         Write-VerboseText(' - WinTitle:          ' + $_.WinTitle)
         Write-VerboseText('   MainWindowHandle:  ' + $_.MainWindowHandle)
         Write-VerboseText('   ProcessId:         ' + $_.ProcessId)
         Write-VerboseText('   Process Path:      ' + $_.ProcessPath)
-        Write-VerboseText('   Process Path (PS): ' + $path)
+
+        $psProcess = Get-Process -Id $_.ProcessId -ErrorAction Ignore
+
+        Write-VerboseText('   Process (PS):      ' + ($psProcess | Format-List | Out-String))
+
+        if (!($psProcess -and ($psProcess | Get-Member Path))) {
+            Write-VerboseText('   Process Path (PS): Property not found!')
+        }
+        else {
+            $psPath = $psProcess.Path
+            Write-VerboseText('   Process Path (PS): ' + $psPath)
+        }
     }
 
 
@@ -5955,13 +5965,25 @@ function Get-StressTestProcessInformation {
         Write-VerboseText('Filtering the windows for "' + $searchForProcess + '":')
 
         $filteredWindowObj = $windowObj | Where-Object {
-            $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.ProcessId)" | Select-Object CommandLine).CommandLine
-            $hasMatch = $commandLine -like $searchForProcess
-
             Write-VerboseText(' - ProcessId:         ' + $_.ProcessId)
             Write-VerboseText('   searchForProcess:  ' + $searchForProcess)
-            Write-VerboseText('   CommandLine:       ' + $commandLine)
-            Write-VerboseText('   hasMatch:          ' + $hasMatch)
+
+            $cimProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($_.ProcessId)"
+
+            Write-VerboseText('   cimProcess:        ' + ($cimProcess | Format-List | Out-String))
+
+            if (!($cimProcess -and ($cimProcess | Get-Member CommandLine))) {
+                Write-VerboseText('   CommandLine:       Property not found!')
+                $hasMatch = $false
+            }
+            else {
+                $commandLine = ($cimProcess | Select-Object CommandLine).CommandLine
+                $hasMatch = $commandLine -like $searchForProcess
+
+                Write-VerboseText('   CommandLine:       ' + $commandLine)
+                Write-VerboseText('   hasMatch:          ' + $hasMatch)
+            }
+
 
             # Return true if the window was identified successfully, so that filteredWindowObj will be the current object
             return $hasMatch
@@ -5977,14 +5999,25 @@ function Get-StressTestProcessInformation {
         Write-VerboseText('Filtering the windows for "' + $searchForProcess + '":')
 
         $filteredWindowObj = $windowObj | Where-Object {
-            $cimProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($_.ProcessId)"
-            $commandLine = ($cimProcess | Select-Object CommandLine).CommandLine
-            $hasMatch = $commandLine -like $searchForProcess
-
             Write-VerboseText(' - ProcessId:         ' + $_.ProcessId)
             Write-VerboseText('   searchForProcess:  ' + $searchForProcess)
-            Write-VerboseText('   CommandLine:       ' + $commandLine)
-            Write-VerboseText('   hasMatch:          ' + $hasMatch)
+
+            $cimProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($_.ProcessId)"
+
+            Write-VerboseText('   cimProcess:        ' + ($cimProcess | Format-List | Out-String))
+
+            if (!($cimProcess -and ($cimProcess | Get-Member CommandLine))) {
+                Write-VerboseText('   CommandLine:       Property not found!')
+                $hasMatch = $false
+            }
+            else {
+                $commandLine = ($cimProcess | Select-Object CommandLine).CommandLine
+                $hasMatch = $commandLine -like $searchForProcess
+
+                Write-VerboseText('   CommandLine:       ' + $commandLine)
+                Write-VerboseText('   hasMatch:          ' + $hasMatch)
+            }
+
 
             # Return true if the window was identified successfully, so that filteredWindowObj will be the current object
             return $hasMatch
@@ -6054,12 +6087,22 @@ function Get-StressTestProcessInformation {
     Write-DebugText('Found the following windows:')
 
     $filteredWindowObj | ForEach-Object {
-        $path = (Get-Process -Id $_.ProcessId -ErrorAction Ignore).Path
         Write-VerboseText(' - WinTitle:          ' + $_.WinTitle)
         Write-VerboseText('   MainWindowHandle:  ' + $_.MainWindowHandle)
         Write-VerboseText('   ProcessId:         ' + $_.ProcessId)
         Write-VerboseText('   Process Path:      ' + $_.ProcessPath)
-        Write-VerboseText('   Process Path (PS): ' + $path)
+
+        $psProcess = Get-Process -Id $_.ProcessId -ErrorAction Ignore
+
+        Write-VerboseText('   Process (PS):      ' + ($psProcess | Format-List | Out-String))
+
+        if (!($psProcess -and ($psProcess | Get-Member Path))) {
+            Write-VerboseText('   Process Path (PS): Property not found!')
+        }
+        else {
+            $psPath = $psProcess.Path
+            Write-VerboseText('   Process Path (PS): ' + $psPath)
+        }
     }
 
 
@@ -9615,6 +9658,19 @@ function Test-StressTestProgrammIsRunning {
     }
 
 
+    # Inform the user that a CPULOAD error might not be a real error
+    if ($errorType -eq 'CPULOAD') {
+        Write-Text('')
+        Write-ColorText('NOTE: A "CPULOAD" error is thrown when the stress test program doesn''t fully utilize the tested core') Cyan
+        Write-ColorText('      over a certain amount of time.') Cyan
+        Write-ColorText('      It might indicate an unstable system, where e.g. the CPU has to error correct a lot due to') Cyan
+        Write-ColorText('      too low voltage or maybe due to clock stretching.') Cyan
+        Write-ColorText('      It might also be an issue with the Windows thread scheduler, so not necessarily a CPU instability.') Cyan
+        Write-ColorText('      Try to see if the error resolves when you use less undervolting, otherwise you can also disable') Cyan
+        Write-ColorText('      this check in the config.ini by setting "disableCpuUtilizationCheck = 0" in the [Debug] section.') Cyan
+    }
+
+
     if ($canUseWindowsEventLog) {
         $coreString   = 'Core ' + $coreNumber + ' (CPU ' + $cpuNumberString + ')'
         $errorString  = 'There has been an error while running ' + $selectedStressTestProgram + '!'
@@ -9746,6 +9802,10 @@ function Resolve-StressTestProgrammIsRunningError {
 
                 $timestamp = Get-Date -Format HH:mm:ss
                 Write-Text($timestamp + ' - Trying to restart ' + $selectedStressTestProgram)
+
+                # We wait for one second here, so that the allocated memory can be freed
+                # One second seems to be enough for 32GB
+                Start-Sleep 1
 
                 # Start the stress test program again
                 # Set the flag to only start the stress test program if possible
@@ -11324,7 +11384,7 @@ if (!(Test-IsVisualCInstalled)) {
     Write-Host('At least version 14 of the VC++ Redistributable is required!') -ForegroundColor Red
     Write-Host('')
     Write-Host('You can download the latest version here:') -ForegroundColor Yellow
-    Write-Host('https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist') -ForegroundColor Cyan
+    Write-Host('https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist#latest-microsoft-visual-c-redistributable-version') -ForegroundColor Cyan
 
     Exit-WithFatalError
 }
