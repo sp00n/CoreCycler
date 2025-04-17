@@ -5177,6 +5177,31 @@ function Get-CurveOptimizerValues {
         [Parameter(Mandatory=$false)] [Switch] $IgnoreInvalidValues
     )
 
+
+    <#
+    .DESCRIPTION
+        Error handler function for the for loop
+        Either displays the error message or throws it we're on the last iteration of the for loop
+        This uses a "continue" statement, which applies to the encompassing for loop
+        And a "throw" statement, which applies to the encompassing try/catch statement
+    .PARAMETER ErrorText
+        [String] The text to display
+    #>
+    function Select-ErrorHandling {
+        param(
+            [Parameter(Mandatory=$false)] [String] $ErrorText
+        )
+
+        if ($numTry -eq $maxTries) {
+            throw($ErrorText)
+        }
+
+        Write-DebugText('Error: ' + $ErrorText)
+        Start-Sleep -Milliseconds 500
+        continue
+    }
+
+
     try {
         Write-DebugText('Trying to query for the Curve Optimizer values')
 
@@ -5188,86 +5213,102 @@ function Get-CurveOptimizerValues {
         $getCoValuesProcessInfo.RedirectStandardOutput = $true
         $getCoValuesProcessInfo.UseShellExecute = $false
 
-        $getCoValuesProcess = New-Object System.Diagnostics.Process
-        $getCoValuesProcess.StartInfo = $getCoValuesProcessInfo
-        $null = $getCoValuesProcess.Start()
 
-        $stdOut = $getCoValuesProcess.StandardOutput.ReadToEnd()
-        $stdErr = $getCoValuesProcess.StandardError.ReadToEnd()
+        # The process can fail with a ZenStates-Core error, we will try multiple times before erroring out
+        $maxTries = 5
 
-        if (!$getCoValuesProcess.WaitForExit(3000)) {
-            $getCoValuesProcess.Kill()
+        for ($numTry = 1; $numTry -le $maxTries; $numTry++) {
+            Write-DebugText('Try ' + $numTry + ' of ' + $maxTries + ' of getting the Curve Optimizer values')
+
+            $getCoValuesProcess = New-Object System.Diagnostics.Process
+            $getCoValuesProcess.StartInfo = $getCoValuesProcessInfo
+            $null = $getCoValuesProcess.Start()
+
+            $stdOut = $getCoValuesProcess.StandardOutput.ReadToEnd()
+            $stdErr = $getCoValuesProcess.StandardError.ReadToEnd()
+
+            if (!$getCoValuesProcess.WaitForExit(3000)) {
+                $getCoValuesProcess.Kill()
+                $getCoValuesProcess.Close()
+                $getCoValuesProcess.Dispose()
+
+                Select-ErrorHandling 'Program didn''t exit within three seconds!'
+            }
+
+            $exitCode = $getCoValuesProcess.ExitCode
+
             $getCoValuesProcess.Close()
             $getCoValuesProcess.Dispose()
 
-            throw('Program didn''t exit within three seconds!')
-        }
 
-        $exitCode = $getCoValuesProcess.ExitCode
+            if ($exitCode -ne 0) {
+                if ($stdErr) {
+                    $msg += [Environment]::NewLine + $stdErr
+                }
 
-        $getCoValuesProcess.Close()
-        $getCoValuesProcess.Dispose()
+                if ($stdOut) {
+                    $msg += [Environment]::NewLine + $stdOut
+                }
 
-
-        if ($exitCode -ne 0) {
-            $msg = 'Program terminated unexpectedly. Exit Code: ' + $exitCode
-
-            if ($stdErr) {
-                $msg += [Environment]::NewLine + $stdErr
+                Select-ErrorHandling ('Program terminated unexpectedly. Exit Code: ' + $exitCode)
             }
 
-            if ($stdOut) {
-                $msg += [Environment]::NewLine + $stdOut
+
+            if ($stdErr -and $stdErr.Length -gt 0) {
+                Select-ErrorHandling ('Error message returned: ' + $stdErr)
             }
 
-            throw($msg)
-        }
 
-        if ($stdErr -and $stdErr.Length -gt 0) {
-            throw('Error message returned: ' + $stdErr)
-        }
-
-        if (!$stdOut -or $stdOut -eq '') {
-            throw('Returned value was empty')
-        }
-
-        # Double trim to also remove any new lines
-        $stdOut = $stdOut.Trim().Trim(' ', '"', '''', [Char]0x09)
-
-        if (!$stdOut -or $stdOut -eq '') {
-            throw('Returned value was empty')
-        }
-
-        $outputLines = @($stdOut -Split '\r?\n')
-
-        Write-DebugText('Returned output:')
-
-        $outputLines | ForEach-Object {
-            Write-DebugText($_)
-        }
-
-        # Try to parse the the CO values
-        # Multiple lines output:
-        # > [maybe stuff]
-        # > Current PBO offsets:
-        # > -1,-1,-1,-1,-1,-1
-        # > (empty line)
-        $coArray = @(($outputLines[$outputLines.Count-1] -Split ',') | Where-Object { $_ -Match '\-?\d+' } | ForEach-Object { [Int] $_ } )
-
-        Write-DebugText('The queried and parsed Curve Optimizer values:')
-        Write-DebugText($coArray)
-
-        if (!$IgnoreCoreCount.IsPresent) {
-            if ($coArray.Count -ne $numPhysCores) {
-                throw('Found ' + $coArray.Count + ' entries instead of the expected ' + $numPhysCores + ':' + [Environment]::NewLine + $coArray)
+            if (!$stdOut -or $stdOut -eq '') {
+                Select-ErrorHandling 'Returned value was empty'
             }
-        }
 
-        # Only reasonable values
-        if (!$IgnoreInvalidValues.IsPresent) {
-            if (@($coArray | Where-Object { [Math]::Abs($_) -gt $limitForCoValues }).Count -gt 0) {
-                throw('Found invalid values (either higher or lower than +-' + $limitForCoValues + ')' + [Environment]::NewLine + $coArray)
+
+            # Double trim to also remove any new lines
+            $stdOut = $stdOut.Trim().Trim(' ', '"', '''', [Char]0x09)
+
+            if (!$stdOut -or $stdOut -eq '') {
+                Select-ErrorHandling 'Returned value was empty'
             }
+
+
+            $outputLines = @($stdOut -Split '\r?\n')
+
+            Write-DebugText('Returned output:')
+
+            $outputLines | ForEach-Object {
+                Write-DebugText($_)
+            }
+
+
+            # Try to parse the the CO values
+            # Multiple lines output:
+            # > [maybe stuff]
+            # > Current PBO offsets:
+            # > -1,-1,-1,-1,-1,-1
+            # > (empty line)
+            $coArray = @(($outputLines[$outputLines.Count-1] -Split ',') | Where-Object { $_ -Match '\-?\d+' } | ForEach-Object { [Int] $_ } )
+
+            Write-DebugText('The queried and parsed Curve Optimizer values:')
+            Write-DebugText($coArray)
+
+            if (!$IgnoreCoreCount.IsPresent) {
+                if ($coArray.Count -ne $numPhysCores) {
+                    Select-ErrorHandling ('Found ' + $coArray.Count + ' entries instead of the expected ' + $numPhysCores + ':' + [Environment]::NewLine + $coArray)
+                }
+            }
+
+
+            # Only reasonable values
+            if (!$IgnoreInvalidValues.IsPresent) {
+                if (@($coArray | Where-Object { [Math]::Abs($_) -gt $limitForCoValues }).Count -gt 0) {
+                    Select-ErrorHandling ('Found invalid values (either higher or lower than +-' + $limitForCoValues + ')' + [Environment]::NewLine + $coArray)
+                }
+            }
+
+
+            # Break the for loop if everything was successful
+            break
         }
 
         return $coArray
@@ -5288,6 +5329,31 @@ function Get-CurveOptimizerValues {
     [Void]
 #>
 function Set-CurveOptimizerValues {
+    <#
+    .DESCRIPTION
+        Error handler function for the for loop
+        Either displays the error message or throws it we're on the last iteration of the for loop
+        This uses a "continue" statement, which applies to the encompassing for loop
+        And a "throw" statement, which applies to the encompassing try/catch statement
+    .PARAMETER ErrorText
+        [String] The text to display
+    #>
+    function Select-ErrorHandling {
+        param(
+            [Parameter(Mandatory=$false)] [String] $ErrorText
+        )
+
+        if ($numTry -eq $maxTries) {
+            throw($ErrorText)
+        }
+
+        Write-DebugText('Error: ' + $ErrorText)
+        Start-Sleep -Milliseconds 500
+        continue
+    }
+
+
+
     Write-VerboseText('Trying to set the Curve Optimizer values')
 
     try {
@@ -5342,61 +5408,77 @@ function Set-CurveOptimizerValues {
         $setCoValuesProcessInfo.RedirectStandardOutput = $true
         $setCoValuesProcessInfo.UseShellExecute = $false
 
-        $setCoValuesProcess = New-Object System.Diagnostics.Process
-        $setCoValuesProcess.StartInfo = $setCoValuesProcessInfo
-        $null = $setCoValuesProcess.Start()
 
-        $stdOut = $setCoValuesProcess.StandardOutput.ReadToEnd()
-        $stdErr = $setCoValuesProcess.StandardError.ReadToEnd()
+        # The process can fail with a ZenStates-Core error, we will try multiple times before erroring out
+        $maxTries = 5
 
-        if (!$setCoValuesProcess.WaitForExit(3000)) {
-            $setCoValuesProcess.Kill()
+        for ($numTry = 1; $numTry -le $maxTries; $numTry++) {
+            Write-DebugText('Try ' + $numTry + ' of ' + $maxTries + ' of setting the Curve Optimizer values')
+
+            $setCoValuesProcess = New-Object System.Diagnostics.Process
+            $setCoValuesProcess.StartInfo = $setCoValuesProcessInfo
+            $null = $setCoValuesProcess.Start()
+
+            $stdOut = $setCoValuesProcess.StandardOutput.ReadToEnd()
+            $stdErr = $setCoValuesProcess.StandardError.ReadToEnd()
+
+            if (!$setCoValuesProcess.WaitForExit(3000)) {
+                $setCoValuesProcess.Kill()
+                $setCoValuesProcess.Close()
+                $setCoValuesProcess.Dispose()
+
+                Select-ErrorHandling ('Program didn''t exit within three seconds!')
+            }
+
+
+            $exitCode = $setCoValuesProcess.ExitCode
             $setCoValuesProcess.Close()
             $setCoValuesProcess.Dispose()
 
-            throw('Program didn''t exit within three seconds!')
-        }
 
-        $exitCode = $setCoValuesProcess.ExitCode
-        $setCoValuesProcess.Close()
-        $setCoValuesProcess.Dispose()
+            if ($exitCode -ne 0) {
+                if ($stdErr) {
+                    $msg += [Environment]::NewLine + $stdErr
+                }
+
+                if ($stdOut) {
+                    $msg += [Environment]::NewLine + $stdOut
+                }
 
 
-        if ($exitCode -ne 0) {
-            $msg = 'Program terminated unexpectedly. Exit Code: ' + $exitCode
-
-            if ($stdErr) {
-                $msg += [Environment]::NewLine + $stdErr
+                Select-ErrorHandling ('Program terminated unexpectedly. Exit Code: ' + $exitCode)
             }
 
-            if ($stdOut) {
-                $msg += [Environment]::NewLine + $stdOut
+
+            if ($stdErr -and $stdErr.Length -gt 0) {
+                Select-ErrorHandling ('Error message returned: ' + $stdErr)
             }
 
-            throw($msg)
-        }
 
-        if ($stdErr -and $stdErr.Length -gt 0) {
-            throw('Error message returned: ' + $stdErr)
-        }
+            # On success this returns the values that have been set
+            if (!$stdOut -or $stdOut -eq '') {
+                Select-ErrorHandling 'Returned value was empty'
+            }
 
-        # On success this returns the values that have been set
-        if (!$stdOut -or $stdOut -eq '') {
-            throw('Returned value was empty')
-        }
 
-        # Double trim to also remove any new lines
-        $stdOut = $stdOut.Trim().Trim(' ', '"', '''', [Char]0x09)
+            # Double trim to also remove any new lines
+            $stdOut = $stdOut.Trim().Trim(' ', '"', '''', [Char]0x09)
 
-        if ($stdOut -eq '') {
-            throw('Returned value was empty')
-        }
+            if ($stdOut -eq '') {
+                Select-ErrorHandling 'Returned value was empty'
+            }
 
-        Write-DebugText('Curve Optimizer values successfuly set:')
 
-        $stdOutLines = @($stdOut -Split '\r?\n')
-        $stdOutLines | ForEach-Object {
-            Write-DebugText($_)
+            Write-DebugText('Curve Optimizer values successfuly set:')
+
+            $stdOutLines = @($stdOut -Split '\r?\n')
+            $stdOutLines | ForEach-Object {
+                Write-DebugText($_)
+            }
+
+
+            # Break the for loop if everything was succesful
+            break
         }
     }
     catch {
