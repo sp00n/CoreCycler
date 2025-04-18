@@ -11223,7 +11223,8 @@ function Get-LastSystemRestorePoint {
 #>
 function Test-CreateNewSystemRestorePoint {
     $askToCreate = ($settings.AutomaticTestMode.askForSystemRestorePointCreation -gt 0)
-    $createNewRestorePoint = $false
+    $shouldCreateNewRestorePoint = $false
+    $canCreateRestorePoint = $false
     $lastRestorePoint = Get-LastSystemRestorePoint
 
     [UInt64] $curTimeStamp = Get-Date -UFormat %s -Millisecond 0
@@ -11268,22 +11269,101 @@ function Test-CreateNewSystemRestorePoint {
         $decision = $Host.UI.PromptForChoice($title, $question, $choices, 0)
 
         if ($decision -eq 0) {
-            $createNewRestorePoint = $true
+            $shouldCreateNewRestorePoint = $true
         }
     }
     else {
         Write-VerboseText('The System Restore Point creation interval time has been exceeded, proceeding to create a new one')
-        $createNewRestorePoint = $true
+        $shouldCreateNewRestorePoint = $true
     }
 
 
-    if ($createNewRestorePoint) {
-        Write-Text('Creating a new System Restore Point...')
-        $timeString = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    if ($shouldCreateNewRestorePoint) {
+        <#
+        .DESCRIPTION
+            Check if the System Restore is enabled or not
+        .OUTPUTS
+            [Bool]
+        #>
+        function Test-IsSystemRestoreEnabled {
+            $Error.Clear()
 
-        Checkpoint-Computer -Description ('CoreCycler Automatic Test Mode ' + $timeString) -RestorePointType MODIFY_SETTINGS
+            $cimInstance = Get-CimInstance -Namespace 'ROOT\DEFAULT' -ClassName 'SystemRestoreConfig' -ErrorAction SilentlyContinue
 
-        Write-Text('System Restore Point created')
+            if ($Error) {
+                Write-DebugText($Error | Out-String)
+            }
+
+            # Alternatively
+            # Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -Name 'RPSessionInterval'
+
+            # RPSessionInterval should be set to 1, even though the Windows doc says this is used for something else
+            # https://learn.microsoft.com/en-us/windows/win32/sr/systemrestoreconfig
+            if ($cimInstance -and ($cimInstance | Get-Member RPSessionInterval) -and $cimInstance.RPSessionInterval -eq 1) {
+                return $true
+            }
+
+            return $false
+        }
+
+
+        # We need to check if the System Restore itself is enabled
+        $canCreateRestorePoint = Test-IsSystemRestoreEnabled
+
+        if (!$canCreateRestorePoint) {
+            if ($askToCreate) {
+                Write-Text('')
+                Write-ColorText('┌─' + '─────────────────────────────────┤ NOTICE ├─────────────────────────────────' + '─┐') Yellow Blue
+                Write-ColorText('│ ' + 'System Restore seems to be disabled for the system drive.'.PadRight(76, ' ') + ' │') Yellow Blue
+                Write-ColorText('│ ' + 'Do you want to enable it, so that the System Restore Point can be created?'.PadRight(76, ' ') + ' │') Yellow Blue
+                Write-ColorText('└─' + '────────────────────────────────────────────────────────────────────────────' + '─┘') Yellow Blue
+                Write-Text('')
+                Write-Text('')
+
+
+                $title    = 'Activate System Restore on the system drive?'
+                $question = ' '
+                $choices  = @(
+                    [System.Management.Automation.Host.ChoiceDescription]::new('&Yes', 'Yes, activate it and create the System Restore Point')
+                    [System.Management.Automation.Host.ChoiceDescription]::new('&No', 'No, do not activate it and do not create a new System Restore Point')
+                )
+                $decision = $Host.UI.PromptForChoice($title, $question, $choices, 0)
+
+                if ($decision -eq 0) {
+                    Write-Text('Enabling System Restore on the system drive...')
+                    Enable-ComputerRestore -Drive $env:SystemDrive
+
+                    # Check again if the System Restore is now anabled
+                    $canCreateRestorePoint = Test-IsSystemRestoreEnabled
+
+                    if (!$canCreateRestorePoint) {
+                        Exit-WithFatalError -text 'Could not enable the System Restore!'
+                    }
+                }
+            }
+
+            # Do not ask to enable the System Restore, just do it
+            else {
+                Enable-ComputerRestore -Drive $env:SystemDrive
+
+                # Check if the System Restore is now anabled
+                $canCreateRestorePoint = Test-IsSystemRestoreEnabled
+
+                if (!$canCreateRestorePoint) {
+                    Exit-WithFatalError -text 'Could not enable the System Restore!'
+                }
+            }
+        }
+
+
+        if ($canCreateRestorePoint) {
+            Write-Text('Creating a new System Restore Point...')
+            $timeString = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+
+            Checkpoint-Computer -Description ('CoreCycler Automatic Test Mode ' + $timeString) -RestorePointType MODIFY_SETTINGS
+
+            Write-Text('System Restore Point created')
+        }
     }
     else {
         Write-Text('Selected to not create a new System Restore Point')
