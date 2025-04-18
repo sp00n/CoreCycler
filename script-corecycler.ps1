@@ -11333,7 +11333,7 @@ function Test-CreateNewSystemRestorePoint {
                     Write-Text('Enabling System Restore on the system drive...')
                     Enable-ComputerRestore -Drive $env:SystemDrive
 
-                    # Check again if the System Restore is now anabled
+                    # Check again if the System Restore is now enabled
                     $canCreateRestorePoint = Test-IsSystemRestoreEnabled
 
                     if (!$canCreateRestorePoint) {
@@ -11346,7 +11346,7 @@ function Test-CreateNewSystemRestorePoint {
             else {
                 Enable-ComputerRestore -Drive $env:SystemDrive
 
-                # Check if the System Restore is now anabled
+                # Check if the System Restore is now enabled
                 $canCreateRestorePoint = Test-IsSystemRestoreEnabled
 
                 if (!$canCreateRestorePoint) {
