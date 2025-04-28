@@ -2,7 +2,7 @@
 .AUTHOR
     sp00n
 .VERSION
-    0.11.0.0alpha2
+    0.11.0.0alpha3
 .DESCRIPTION
     Sets the affinity of the selected stress test program process to only one
     core and cycles through all the cores which allows to test the stability of
@@ -23,7 +23,7 @@ param(
 
 
 # Our current version
-$version = '0.11.0.0alpha2'
+$version = '0.11.0.0alpha3'
 
 
 # This defines the strict mode
@@ -120,6 +120,7 @@ $coreTestOrderMode             = $null
 $coreTestOrderCustom           = [System.Collections.ArrayList]::new()
 $scriptExit                    = $false
 $fatalError                    = $false
+$exitCode                      = 0
 $previousFileSize              = $null
 $previousPassedFFTSize         = $null
 $previousPassedFFTEntry        = $null
@@ -467,7 +468,7 @@ mode = SSE
 # Heavy            4K to 1344K - special preset, recommended in the "Curve Optimizer Guide Ryzen 5000"
 # HeavyShort       4K to  160K - special preset, recommended in the "Curve Optimizer Guide Ryzen 5000"
 #
-# You can also define you own range by entering two FFT sizes joined by a hyphen, e.g 36-1344
+# You can also define a single FFT size by just entering the value, or your own range by entering two FFT sizes joined by a hyphen, e.g 36-1344
 #
 # Default: Huge
 FFTSize = Huge
@@ -482,6 +483,10 @@ FFTSize = Huge
 # The test modes for y-cruncher
 # y-cruncher offer various test modes (binaries/algorithms), that require different instruction sets to be available
 # See the \test_programs\y-cruncher\Binaries\Tuning.txt file for a detailed explanation
+#
+# Automatic selection vs. manual selection:
+# You can use the "auto" setting, in which case y-cruncher will automatically decide which binary it chooses for your CPU
+# If instead you want to manually select a specific binary, you can see the list below:
 #
 # Test Mode Name       Automatic Selection For             Required Instruction Set
 # --------------       -----------------------             ------------------------
@@ -842,6 +847,11 @@ repeatCoreOnError = 1
 #            Be aware that this might pose a security risk though, so make sure to consider the risks!
 #            https://learn.microsoft.com/en-us/sysinternals/downloads/autologon
 #            https://learn.microsoft.com/en-us/troubleshoot/windows-server/user-profiles-and-logon/turn-on-automatic-logon
+#
+# NOTE: On some systems, especially Ryzen 9000 systems, the computer doesn't seem to reset during an unstable
+#       Curve Optimizer setting, instead it just seems to freeze and would need to be manually restarted.
+#       Unfortunately there's currently no way around this that I know of.
+#       Maybe there is a BIOS setting somewhere, if you know something, please let me know.
 #
 # Default: 0
 enableResumeAfterUnexpectedExit = 0
@@ -1223,6 +1233,7 @@ $stressTestPrograms = @{
         'commandWithLogging'  = 'cmd /C start /MIN /AFFINITY 0xC "y-cruncher - %fileName%" "%helpersPath%WriteConsoleToWriteFileWrapper.exe" "%fullPathToLoadExe%" priority:-1 config "%configFilePath%" /dlllog:"%logFilePath%"'
         'windowBehaviour'     = 6
         'testModes'           = @(
+            'auto'
             '04-P4P'
             '05-A64 ~ Kasumi'
             '08-NHM ~ Ushio'
@@ -1270,6 +1281,7 @@ $stressTestPrograms = @{
         'commandWithLogging'  = 'cmd /C start /MIN /AFFINITY 0xC "y-cruncher - %fileName%" "%helpersPath%WriteConsoleToWriteFileWrapper.exe" "%fullPathToLoadExe%" priority:2 config "%configFilePath%" /dlllog:"%logFilePath%"'
         'windowBehaviour'     = 6
         'testModes'           = @(
+            'auto'
             '00-x86'
             '04-P4P'
             '05-A64 ~ Kasumi'
@@ -2323,16 +2335,24 @@ function Write-SettingIntroText {
 #>
 function Exit-Script {
     param(
-        [Parameter(Mandatory=$false)] $text
+        [Parameter(Mandatory=$false)] $text,
+        [Parameter(Mandatory=$false)] $errorCode
     )
 
     $Script:scriptExit = $true
+    $Script:exitCode = 0
+
+    if ($errorCode -and $errorCode -ne 0) {
+        $Script:exitCode = $errorCode
+    }
 
     if ($text) {
         Write-Text($text)
     }
 
-    exit
+    Write-DebugText('Exiting with exit code: ' + $Script:exitCode)
+
+    exit $Script:exitCode
 }
 
 
@@ -2354,6 +2374,7 @@ function Exit-WithFatalError {
     )
 
     $Script:fatalError = $true
+    $Script:exitCode = 999  # Same as the Event Log entry
 
 
     if ($text) {
@@ -2375,7 +2396,7 @@ function Exit-WithFatalError {
     Write-Host 'When reporting this error, please provide this log file.' -ForegroundColor Yellow
 
     Read-Host -Prompt 'Press Enter to exit'
-    exit
+    exit $Script:exitCode
 }
 
 
@@ -2383,30 +2404,41 @@ function Exit-WithFatalError {
 <#
 .DESCRIPTION
     Check if the Visual C++ Redistributable package is installed
+    We need both x86 and x64
 .OUTPUTS
     [Bool]
 #>
 function Test-IsVisualCInstalled {
-    $found = $false
+    $foundX86 = $false
+    $foundX64 = $false
     $regKeyEntries = Get-ChildItem 'HKLM:\SOFTWARE\WoW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
 
     foreach ($entry in $regKeyEntries) {
         $displayName = $entry.GetValue('DisplayName')
 
         if ($displayName -match '^Microsoft Visual C\+\+\D*(?<Year>(\d|-){4,9}).*Redistributable.*') {
-            $versionString = $entry.GetValue('DisplayVersion')
-            $versionArr = $versionString -Split '\.'
+            $name = $entry.GetValue('DisplayName')
+            $mainVersion = [Int] $entry.GetValue('VersionMajor')
+            $subVersion = [Int] $entry.GetValue('VersionMinor')
+            $isX64 = ($name -Match 'x64')
 
-            # At least version 14 I guess
-            # We may need to ask for more specific sub versions
-            if ($versionArr[0] -Match '^[\d\.]+$' -and [Int] $versionArr[0] -ge 14) {
-                $found = $true
-                break
+            # At least version 14.29 is required, for both x86 and x64
+            if ($mainVersion -ge 14 -and $subVersion -ge 29) {
+                if ($isX64) {
+                    $foundX64 = $true
+                }
+                else {
+                    $foundX86 = $true
+                }
+
+                if ($foundX86 -and $foundX64) {
+                    break
+                }
             }
         }
     }
 
-    return $found
+    return ($foundX86 -and $foundX64)
 }
 
 
@@ -2414,6 +2446,7 @@ function Test-IsVisualCInstalled {
 <#
 .DESCRIPTION
     Check if the .NET 8 is installed
+    We specifically need .NET 8, only .NET 9 will not work
 .OUTPUTS
     [Bool]
 #>
@@ -2432,7 +2465,7 @@ function Test-IsDotNetInstalled {
     foreach ($versionString in $installedVersions) {
         $versionArr = $versionString -Split '\.'
 
-        if ($versionArr[0] -Match '^[\d\.]+$' -and [Int] $versionArr[0] -ge 8) {
+        if ($versionArr[0] -Match '^[\d\.]+$' -and [Int] $versionArr[0] -eq 8) {
             $found = $true
             break
         }
@@ -2763,6 +2796,7 @@ function Show-FinalSummary {
     Write-ColorText('╟──────────────────────────────────┤ Summary ├─────────────────────────────────╢') Green
     Write-ColorText('╚══════════════════════════════════════════════════════════════════════════════╝') Green
     Write-Text('')
+    Write-ColorText('Ended at:     ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) Cyan
     Write-ColorText('Run time:     ' + $runTimeString) Cyan
     Write-ColorText('Iterations:   ' + $startedIterations + ' started / ' + $completedIterations + ' completed') Cyan
     Write-ColorText('Tested cores: ' + $testedCoresArray.Count + ' cores / ' + $numTestedCores + ' tests') Cyan
@@ -4426,6 +4460,7 @@ function Import-Settings {
             # Split them into an array
             elseif ($section -eq 'yCruncher' -and $name -eq 'tests') {
                 $thisSetting = @()
+                $oriValue = $value
 
                 # Empty value, use the default
                 if ($null -eq $value -or [String]::IsNullOrWhiteSpace($value)) {
@@ -4466,6 +4501,9 @@ function Import-Settings {
                 }
 
                 $setting = $selectedTests
+
+                # Store the original tests in a separate variable
+                $ini[$section][$name + '_original'] = $oriValue
             }
 
 
@@ -4736,6 +4774,7 @@ function Get-Settings {
 
 
     # The selected mode for y-cruncher = the binary to execute
+    # "auto" means we let y-cruncher decide = y-cruncher.exe
     # Override the variables
     if ($isYCruncher -or $isYCruncherOld) {
         # Allow shortcuts for y-cruncher
@@ -4759,6 +4798,13 @@ function Get-Settings {
 
 
         $yCruncherBinary = $stressTestPrograms[$settings.General.stressTestProgram]['testModes'] | Where-Object -FilterScript { $_.ToLowerInvariant() -eq $settings.mode.ToLowerInvariant() }
+
+        # "auto" means we let y-cruncher select which binary to run
+        # But we won't use y-cruncher to do the actual stress test, instead we execute it once with a forced failed start and extract which binary it selected
+        if ($yCruncherBinary -eq 'auto') {
+            $yCruncherBinary = Test-WhichYCruncherBinary
+        }
+
         $Script:stressTestPrograms[$settings.General.stressTestProgram]['processName']        = $yCruncherBinary
         $Script:stressTestPrograms[$settings.General.stressTestProgram]['processNameForLoad'] = $yCruncherBinary
         $Script:stressTestPrograms[$settings.General.stressTestProgram]['fullPathToExe']      = $stressTestPrograms[$settings.General.stressTestProgram]['absolutePath'] + $yCruncherBinary
@@ -5002,7 +5048,7 @@ function Initialize-AutomaticTestMode {
             Write-ColorText('You did not select to open the script with administrator rights, but the') Red
             Write-ColorText('Automatic Test Mode feature requires it') Red
             Write-ColorText('Aborting') Red
-            Exit-Script
+            Exit-Script -errorCode 2
         }
     }
     else {
@@ -6022,14 +6068,19 @@ function Get-StressTestProcessInformation {
 
         $psProcess = Get-Process -Id $_.ProcessId -ErrorAction Ignore
 
-        Write-VerboseText('   Process (PS):      ' + ($psProcess | Format-List | Out-String))
-
         if (!($psProcess -and ($psProcess | Get-Member Path))) {
             Write-VerboseText('   Process Path (PS): Property not found!')
+            Write-VerboseText('   Process (PS):      ' + ($psProcess | Format-List | Out-String))
         }
         else {
-            $psPath = $psProcess.Path
-            Write-VerboseText('   Process Path (PS): ' + $psPath)
+            Write-VerboseText('   Process (PS):')
+            Write-VerboseText('     .Id:               ' + $psProcess.Id)
+            Write-VerboseText('     .Name:             ' + $psProcess.Name)
+            Write-VerboseText('     .Path:             ' + $psProcess.Path)
+            Write-VerboseText('     .MainWindowHandle: ' + $psProcess.MainWindowHandle)
+            Write-VerboseText('     .MainWindowTitle:  ' + $psProcess.MainWindowTitle)
+            Write-VerboseText('     .HasExited:        ' + $psProcess.HasExited)
+            Write-VerboseText('     .ExitCode:         ' + $psProcess.ExitCode)
         }
     }
 
@@ -6047,23 +6098,26 @@ function Get-StressTestProcessInformation {
         Write-VerboseText('Filtering the windows for "' + $searchForProcess + '":')
 
         $filteredWindowObj = $windowObj | Where-Object {
-            Write-VerboseText(' - ProcessId:         ' + $_.ProcessId)
-            Write-VerboseText('   searchForProcess:  ' + $searchForProcess)
+            Write-VerboseText(' - ProcessId:           ' + $_.ProcessId)
+            Write-VerboseText('   searchForProcess:    ' + $searchForProcess)
 
             $cimProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($_.ProcessId)"
 
-            Write-VerboseText('   cimProcess:        ' + ($cimProcess | Format-List | Out-String))
-
             if (!($cimProcess -and ($cimProcess | Get-Member CommandLine))) {
-                Write-VerboseText('   CommandLine:       Property not found!')
+                Write-VerboseText('   CommandLine:         Property not found!')
+                Write-VerboseText('   cimProcess:          ' + ($cimProcess | Format-List | Out-String))
                 $hasMatch = $false
             }
             else {
-                $commandLine = ($cimProcess | Select-Object CommandLine).CommandLine
-                $hasMatch = $commandLine -like $searchForProcess
+                $hasMatch = $cimProcess.CommandLine -like $searchForProcess
 
-                Write-VerboseText('   CommandLine:       ' + $commandLine)
-                Write-VerboseText('   hasMatch:          ' + $hasMatch)
+                Write-VerboseText('   hasMatch:            ' + $hasMatch)
+                Write-VerboseText('   cimProcess:')
+                Write-VerboseText('     .ProcessId:        ' + $cimProcess.ProcessId)
+                Write-VerboseText('     .Name:             ' + $cimProcess.Name)
+                Write-VerboseText('     .ExecutablePath:   ' + $cimProcess.ExecutablePath)
+                Write-VerboseText('     .CommandLine:      ' + $cimProcess.CommandLine)
+                Write-VerboseText('     .ParentProcessId:  ' + $cimProcess.ParentProcessId)
             }
 
 
@@ -6169,21 +6223,26 @@ function Get-StressTestProcessInformation {
     Write-DebugText('Found the following windows:')
 
     $filteredWindowObj | ForEach-Object {
-        Write-VerboseText(' - WinTitle:          ' + $_.WinTitle)
-        Write-VerboseText('   MainWindowHandle:  ' + $_.MainWindowHandle)
-        Write-VerboseText('   ProcessId:         ' + $_.ProcessId)
-        Write-VerboseText('   Process Path:      ' + $_.ProcessPath)
+        Write-VerboseText(' - WinTitle:             ' + $_.WinTitle)
+        Write-VerboseText('   MainWindowHandle:     ' + $_.MainWindowHandle)
+        Write-VerboseText('   ProcessId:            ' + $_.ProcessId)
+        Write-VerboseText('   Process Path:         ' + $_.ProcessPath)
 
         $psProcess = Get-Process -Id $_.ProcessId -ErrorAction Ignore
 
-        Write-VerboseText('   Process (PS):      ' + ($psProcess | Format-List | Out-String))
-
         if (!($psProcess -and ($psProcess | Get-Member Path))) {
             Write-VerboseText('   Process Path (PS): Property not found!')
+            Write-VerboseText('   Process (PS):         ' + ($psProcess | Format-List | Out-String))
         }
         else {
-            $psPath = $psProcess.Path
-            Write-VerboseText('   Process Path (PS): ' + $psPath)
+            Write-VerboseText('   Process (PS):')
+            Write-VerboseText('     .Id:                ' + $psProcess.Id)
+            Write-VerboseText('     .Name:              ' + $psProcess.Name)
+            Write-VerboseText('     .Path:              ' + $psProcess.Path)
+            Write-VerboseText('     .MainWindowHandle:  ' + $psProcess.MainWindowHandle)
+            Write-VerboseText('     .MainWindowTitle:   ' + $psProcess.MainWindowTitle)
+            Write-VerboseText('     .HasExited:         ' + $psProcess.HasExited)
+            Write-VerboseText('     .ExitCode:          ' + $psProcess.ExitCode)
         }
     }
 
@@ -6212,9 +6271,7 @@ function Get-StressTestProcessInformation {
         Write-ColorText('There exist multiple windows with the same name as the stress test program:') Red
 
         $filteredWindowObj | ForEach-Object {
-            #$path = (Get-Process -Id $_.ProcessId -ErrorAction Ignore).Path
             Write-ColorText(' - Windows Title: ' + $_.WinTitle) Yellow
-            #Write-ColorText('   Process Path:  ' + $path) Yellow
             Write-ColorText('   Process Path:  ' + $_.ProcessPath) Yellow
             Write-ColorText('   Process Id:    ' + $_.ProcessId) Yellow
         }
@@ -6226,6 +6283,87 @@ function Get-StressTestProcessInformation {
 
     # We've now found our main window object, get the corresponding PowerShell process object for it
     $thisWindowProcess = Get-Process -Id $filteredWindowObj.ProcessId -ErrorAction Ignore
+
+
+
+    # If we're using the "auto" mode for y-cruncher, we have to find out which binary it has chosen
+    if ($stressTestPrograms[$settings.General.stressTestProgram]['processNameForLoad'] -eq 'y-cruncher') {
+        $foundTheBinary = $false
+
+        # If the write console wrapper for y-cruncher is enabled, we need to look for the child process of the child process
+        # WriteConsoleToWriteFileWrapper.exe
+        #   - y-cruncher.exe
+        #     - 19-ZN2 ~ Kagari.exe
+        for ($i = 1; $i -le 10; $i++) {
+            Write-DebugText('Trying to get the correct binary for the "auto" mode for y-cruncher... (try #' + $i + ')')
+            $yCruncherProcess = $null
+            $yCruncherProcessId = $null
+
+            if ($isYCruncherWithLogging) {
+                $searchForProcessWql = ($stressTestPrograms[$settings.General.stressTestProgram]['fullPathToLoadExe'] + '.' + $stressTestPrograms[$settings.General.stressTestProgram]['processNameExt']).Replace('\', '\\')
+                $yCruncherProcess = Get-CimInstance Win32_Process -Filter ('ParentProcessId = ' + $thisWindowProcess.Id + ' AND ExecutablePath = ''' + $searchForProcessWql + '''')
+
+                if (!$yCruncherProcess) {
+                    Start-Sleep -Milliseconds 250
+                    continue
+                }
+
+                $yCruncherProcessId = $yCruncherProcess.ProcessId
+
+                Write-DebugText('Found the y-cruncher process:')
+                Write-DebugText('ProcessId:'.PadRight(20, ' ') + $yCruncherProcess.ProcessId)
+                Write-DebugText('Name:'.PadRight(20, ' ') + $yCruncherProcess.Name)
+                Write-DebugText('ExecutablePath:'.PadRight(20, ' ') + $yCruncherProcess.ExecutablePath)
+                Write-DebugText('CommandLine:'.PadRight(20, ' ') + $yCruncherProcess.CommandLine)
+                Write-DebugText('ParentProcessId:'.PadRight(20, ' ') + $yCruncherProcess.ParentProcessId)
+            }
+            else {
+                $yCruncherProcess = $thisWindowProcess
+                $yCruncherProcessId = $yCruncherProcess.Id
+            }
+
+            if (!$yCruncherProcessId) {
+                Start-Sleep -Milliseconds 250
+                continue
+            }
+
+
+            $childProcesses = Get-CimInstance Win32_Process -Filter ('ParentProcessId = ' + $yCruncherProcessId)
+
+            if (!$childProcesses) {
+                continue
+            }
+
+            foreach ($childProcess in $childProcesses) {
+                $nameNoExe = [IO.Path]::GetFileNameWithoutExtension($childProcess.ExecutablePath)
+
+                if (!($stressTestPrograms[$settings.General.stressTestProgram]['testModes'] -contains $nameNoExe)) {
+                    continue
+                }
+
+
+                Write-DebugText('Found the y-cruncher load binary process:')
+                Write-DebugText('ProcessId:'.PadRight(20, ' ') + $childProcess.ProcessId)
+                Write-DebugText('Name:'.PadRight(20, ' ') + $childProcess.Name)
+                Write-DebugText('ExecutablePath:'.PadRight(20, ' ') + $childProcess.ExecutablePath)
+                Write-DebugText('CommandLine:'.PadRight(20, ' ') + $childProcess.CommandLine)
+                Write-DebugText('ParentProcessId:'.PadRight(20, ' ') + $childProcess.ParentProcessId)
+
+
+                # Override the process name for the load binary with the one we just located
+                $Script:stressTestPrograms[$settings.General.stressTestProgram]['processNameForLoad'] = $nameNoExe
+                $foundTheBinary = $true
+                break
+            }
+
+            break
+        }
+
+
+        if (!$foundTheBinary) {
+            Exit-WithFatalError -text 'Could not find the load binary for y-cruncher''s auto mode!'
+        }
+    }
 
 
     # Also, the process performing the stress test can actually be different to the main window of the stress test program
@@ -6892,10 +7030,16 @@ function Initialize-Prime95 {
         $Script:maxFFTSize = [Int] $settings.Prime95Custom.MaxTortureFFT * 1024
     }
 
-    # Custom preset (xxx-yyy)
+    # Custom range (xxx-yyy)
     elseif ($settings.Prime95.FFTSize -Match '(\d+)\s*\-\s*(\d+)') {
         $Script:minFFTSize = [Int] [Math]::Min($Matches[1], $Matches[2]) * 1024
         $Script:maxFFTSize = [Int] [Math]::Max($Matches[1], $Matches[2]) * 1024
+    }
+
+    # Custom single FFT size
+    elseif ($settings.Prime95.FFTSize -Match '(\d+)') {
+        $Script:minFFTSize = [Int] $Matches[1] * 1024
+        $Script:maxFFTSize = [Int] $Matches[1] * 1024
     }
 
     # Regular preset
@@ -7919,6 +8063,83 @@ function Close-Aida64 {
 
 <#
 .DESCRIPTION
+    Tests which y-cruncher binary is being auto selected
+    We're starting y-cruncher with an invalid command so that it doesn't start testing, but still displays the used binary
+.OUTPUTS
+    [String] The automatically selected binary by y-cruncher
+#>
+function Test-WhichYCruncherBinary {
+    try {
+        Write-VerboseText('Trying to determine the automatically selected binary by y-cruncher')
+
+        $command = $helpersPathAbsolute + 'WriteConsoleToWriteFileWrapper.exe'
+        $filePath = $PSScriptRoot + '\' + $stressTestPrograms[$(if ($isYCruncherOld) { 'ycruncher_old' } else { 'ycruncher' })]['installPath'] + '\y-cruncher.exe'
+        $arguments = 'pause:-2 colors:0 fake-invalid-command'
+        $finalArguments = $filePath + ' ' + $arguments + ' /dlllog:""'
+
+        Write-DebugText($command)
+        Write-DebugText($finalArguments)
+
+
+        $yCruncherBinaryProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $yCruncherBinaryProcessInfo.FileName = $command
+        $yCruncherBinaryProcessInfo.Arguments = $finalArguments
+        $yCruncherBinaryProcessInfo.RedirectStandardError = $true
+        $yCruncherBinaryProcessInfo.RedirectStandardOutput = $true
+        $yCruncherBinaryProcessInfo.UseShellExecute = $false
+
+        $yCruncherBinaryProcess = New-Object System.Diagnostics.Process
+        $yCruncherBinaryProcess.StartInfo = $yCruncherBinaryProcessInfo
+        $null = $yCruncherBinaryProcess.Start()
+
+        $stdOut = $yCruncherBinaryProcess.StandardOutput.ReadToEnd()
+        $stdErr = $yCruncherBinaryProcess.StandardError.ReadToEnd()
+
+        if (!$yCruncherBinaryProcess.WaitForExit(3000)) {
+            $yCruncherBinaryProcess.Kill()
+            $yCruncherBinaryProcess.Close()
+            $yCruncherBinaryProcess.Dispose()
+
+            Write-DebugText('The program didn''t exit within three seconds')
+            throw('Error when trying to detect the automatically selected binary for y-cruncher!')
+        }
+
+        $yCruncherBinaryProcess.Close()
+        $yCruncherBinaryProcess.Dispose()
+
+        # Look for the auto selected binary in the output
+        $hasFoundBinaryMatch = $stdOut -Match 'Auto-Selecting: (.+)'
+        $autoBinary = $null
+
+        if ($hasFoundBinaryMatch) {
+            $autoBinary = $Matches[1]
+            Write-DebugText($Matches[0])
+            Write-VerboseText('Found our automatically selected binary: ' + $autoBinary)
+        }
+        else {
+            Write-DebugText('No match found!')
+
+            throw('Error when trying to detect the automatically selected binary for y-cruncher!')
+        }
+    }
+    catch {
+        Write-DebugText('stdOut:')
+        Write-DebugText($stdOut)
+        Write-DebugText('')
+        Write-DebugText('stdErr:')
+        Write-DebugText($stdErr)
+
+        Exit-WithFatalError -text $_
+    }
+
+
+    return $autoBinary
+}
+
+
+
+<#
+.DESCRIPTION
     Create the y-cruncher config file
     This depends on the $settings.mode variable
 .PARAMETER overrideNumberOfThreads
@@ -7955,7 +8176,6 @@ function Initialize-yCruncher {
         Exit-WithFatalError
     }
 
-    $modeString    = $settings.mode
     $configFile    = $stressTestPrograms[$settings.General.stressTestProgram]['configFilePath']
     $selectedTests = $settings.yCruncher.tests
 
@@ -7982,13 +8202,25 @@ function Initialize-yCruncher {
     }
 
 
+    # We have already filtered out any invalid tests in Get-Settings, now check if we have any settings left at all
+    if (!$selectedTests -or $selectedTests.Count -lt 1) {
+        $availableTests = $stressTestPrograms[$(if ($isYCruncherOld) { 'ycruncher_old' } else { 'ycruncher' })]['availableTests']
+        $testsFromSettings = $settings.yCruncher.tests_original
+        $message  = 'Did not find any valid tests for the selected y-cruncher version!'
+        $message += [Environment]::NewLine + 'Selected tests:  ' + $testsFromSettings
+        $message += [Environment]::NewLine + 'Available tests: ' + ($availableTests -Join ', ')
+
+        Exit-WithFatalError -text $message
+    }
+
+
     # The "C17" test only works with "13-HSW ~ Airi" and above
     # Let's use the first two digits to determine this (so 00 to 22)
     if ($selectedTests.Contains('C17')) {
-        $modeNum = [Int] $modeString.Substring(0, 2)
+        $modeNum = [Int] $binaryToRun.Substring(0, 2)
 
         if ($modeNum -lt 13) {
-            Exit-WithFatalError -text ('Test "C17" is present in the "tests" setting, but the selected y-cruncher mode "' + $modeString + '" does not support it! Aborting!')
+            Exit-WithFatalError -text ('Test "C17" is present in the "tests" setting, but the selected y-cruncher mode "' + $binaryToRun + '" does not support it! Aborting!')
         }
     }
 
@@ -9856,7 +10088,7 @@ function Resolve-StressTestProgrammIsRunningError {
             Write-ColorText($logFileFullPath) Cyan
             Write-Text('')
 
-            Exit-Script
+            Exit-Script -errorCode 3
         }
 
         # y-cruncher can keep on running if the log wrapper is enabled and restartTestProgramForEachCore is not set
@@ -11531,8 +11763,8 @@ if (!(Test-IsDotNetInstalled)) {
     Write-Host('')
     Write-Host('FATAL ERROR: .NET 8 could not be found on the system!') -ForegroundColor Red
     Write-Host('')
-    Write-Host('You can download the latest version here:') -ForegroundColor Yellow
-    Write-Host('https://dotnet.microsoft.com/en-us/download') -ForegroundColor Cyan
+    Write-Host('You can download .NET 8 for Windows x64 (the SDK or Runtime) here:') -ForegroundColor Yellow
+    Write-Host('https://dotnet.microsoft.com/en-us/download/dotnet/8.0') -ForegroundColor Cyan
 
     Exit-WithFatalError
 }
@@ -11543,9 +11775,9 @@ if (!(Test-IsDotNetInstalled)) {
 if (!(Test-IsVisualCInstalled)) {
     Write-Host('')
     Write-Host('FATAL ERROR: Visual C++ Runtime could not be found or the version is too old!') -ForegroundColor Red
-    Write-Host('At least version 14 of the VC++ Redistributable is required!') -ForegroundColor Red
+    Write-Host('At least version 14.29 of the x86 and x64 VC++ Redistributable is required!') -ForegroundColor Red
     Write-Host('')
-    Write-Host('You can download the latest version here:') -ForegroundColor Yellow
+    Write-Host('You can download the latest versions here:') -ForegroundColor Yellow
     Write-Host('https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist#latest-microsoft-visual-c-redistributable-version') -ForegroundColor Cyan
 
     Exit-WithFatalError
@@ -11997,10 +12229,10 @@ try {
 
     # Get the final stress test program file paths and command lines
     foreach ($testProgram in $stressTestPrograms.GetEnumerator()) {
-        $stressTestPrograms[$testProgram.Name]['absolutePath']        = $PSScriptRoot + '\' + $testProgram.Value['processPath'] + '\'
-        $stressTestPrograms[$testProgram.Name]['absoluteInstallPath'] = $PSScriptRoot + '\' + $testProgram.Value['installPath'] + '\'
-        $stressTestPrograms[$testProgram.Name]['fullPathToExe']       = $testProgram.Value['absolutePath'] + $testProgram.Value['processName']
-        $stressTestPrograms[$testProgram.Name]['configFilePath']      = $testProgram.Value['absolutePath'] + $testProgram.Value['configName']
+        $Script:stressTestPrograms[$testProgram.Name]['absolutePath']        = $PSScriptRoot + '\' + $testProgram.Value['processPath'] + '\'
+        $Script:stressTestPrograms[$testProgram.Name]['absoluteInstallPath'] = $PSScriptRoot + '\' + $testProgram.Value['installPath'] + '\'
+        $Script:stressTestPrograms[$testProgram.Name]['fullPathToExe']       = $testProgram.Value['absolutePath'] + $testProgram.Value['processName']
+        $Script:stressTestPrograms[$testProgram.Name]['configFilePath']      = $testProgram.Value['absolutePath'] + $testProgram.Value['configName']
 
         # If we have a comma separated list, remove all spaces and transform to upper case
         # yCruncher and yCruncher Old share the same setting in the config file, adjust for that
@@ -12042,7 +12274,7 @@ try {
                 $Script:stressTestLogFilePath = $logFilePathAbsolute + $stressTestLogFileName
             }
 
-            $stressTestPrograms[$testProgram.Name]['fullPathToLoadExe'] = $testProgram.Value['absolutePath'] + $testProgram.Value['processNameForLoad']
+            $Script:stressTestPrograms[$testProgram.Name]['fullPathToLoadExe'] = $testProgram.Value['absolutePath'] + $testProgram.Value['processNameForLoad']
 
             $data['%fileName%'] = ($testProgram.Value['processNameForLoad'] + '.' + $testProgram.Value['processNameExt'])
             $data.add('%fullPathToLoadExe%', $testProgram.Value['fullPathToLoadExe'] + '.' + $testProgram.Value['processNameExt'])
@@ -12126,7 +12358,7 @@ try {
             $command = $command.Replace($key, $data[$key])
         }
 
-        $stressTestPrograms[$testProgram.Name]['command'] = $command
+        $Script:stressTestPrograms[$testProgram.Name]['command'] = $command
     }
 
 
@@ -12806,7 +13038,7 @@ try {
     }
 
     # Remove ignored cores
-    [System.Collections.ArrayList] $coresToTest = @($coresToTest | Where-Object { $_ -notin $settings.General.coresToIgnore })
+    [System.Collections.ArrayList] $coresToTest = @($coresToTest | Where-Object { $_ -NotIn $settings.General.coresToIgnore })
 
 
     # Add the previously tested core from before the reboot if we're in Automatic Test Mode with resume
@@ -12862,7 +13094,7 @@ try {
             Close-StressTestProgram
 
             Write-ColorText($timestamp + ' - All Cores have thrown an error, aborting!') Yellow
-            Exit-Script
+            Exit-Script -errorCode 4
         }
 
 
@@ -12873,7 +13105,7 @@ try {
             $autoModeDescription = $(if ($useCurveOptimizer) { 'Curve Optimizer' } elseif ($useIntelVoltageAdjustment) { 'voltage offset' })
 
             Write-ColorText($timestamp + ' - All Cores have reached the maximum ' + $autoModeDescription + ' value and thrown an error, aborting!') Yellow
-            Exit-Script
+            Exit-Script -errorCode 5
         }
 
 
@@ -13200,7 +13432,9 @@ try {
                     # Also adjust the expected end time for this delay
                     $estimatedEndDateCore += New-TimeSpan -Seconds $settings.General.delayBetweenCores
 
+                    Write-DebugText((Get-Date -Format HH:mm:ss) + ' - Starting to wait')
                     Start-Sleep -Seconds $settings.General.delayBetweenCores
+                    Write-DebugText((Get-Date -Format HH:mm:ss) + ' - Sleepy time has ended')
                 }
 
 
@@ -13464,7 +13698,7 @@ try {
                     Write-DebugText($timestamp + ' - Suspending the stress test process for ' + $suspensionTime + ' milliseconds')
 
                     $suspended = Suspend-Process $stressTestProcess
-                    Write-DebugText('           Suspended: ' + $suspended)
+                    Write-DebugText('           Suspended' + $(if ($modeToUseForSuspension -eq 'threads') { ' threads' }) + ': ' + $suspended)
 
                     Start-Sleep -Milliseconds $suspensionTime
 
@@ -13472,7 +13706,7 @@ try {
                     Write-DebugText($timestamp + ' - Resuming the stress test process')
 
                     $resumed = Resume-Process -process $stressTestProcess
-                    Write-DebugText('           Resumed: ' + $resumed)
+                    Write-DebugText('           Resumed' + $(if ($modeToUseForSuspension -eq 'threads') { ' threads' }) + ':   ' + $resumed)
                 }
 
 
@@ -14317,7 +14551,7 @@ finally {
     # Don't do anything after a fatal error
     if ($fatalError) {
         Write-DebugText('Exit-WithFatalError was called, skipping the rest')
-        exit
+        exit $Script:exitCode
     }
 
 
@@ -14325,7 +14559,7 @@ finally {
     if ($scriptExit) {
         # Show the final summary
         Show-FinalSummary
-        exit
+        exit $Script:exitCode
     }
 
 

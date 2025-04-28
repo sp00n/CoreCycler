@@ -17,6 +17,10 @@ https://github.com/mann1x/BoostTesterMannix
 
 
 
+You can use the --core-repeat <n> command line argument to make it run longer
+on a core.
+For example with "BoostTester.sp00n.exe --core-repeat 3" it will spend three
+times as long on each individual core.
 
 
 

@@ -97,12 +97,18 @@ function Add-XmlFileForCustomView {
 
     Write-Host
 
-    # File path doesn't exist
+    # The Event Viewer path doesn't exist, this can happen if the Event Viewer was never executed
+    # Try to create it ourselve
     if (!(Test-Path $path -PathType Container)) {
-        Write-Host 'The path to put the config file for the Custom View into doesn''t exist!' -ForegroundColor Red
-        Write-Host ('(' + $path + ')') -ForegroundColor Red
-        Write-Host 'Not trying to create the file' -ForegroundColor Red
-        return
+        try {
+            $null = New-Item -ItemType Directory -Path $path -ErrorAction Stop
+        }
+        catch {
+            Write-Host 'The path to put the config file for the Custom View into doesn''t exist, and we were unable to create it.' -ForegroundColor Red
+            Write-Host ('(' + $path + ')') -ForegroundColor Red
+            Write-Host 'Not trying to create the file for the Custom View' -ForegroundColor Red
+            return
+        }
     }
 
     # Skip if the file already exists
