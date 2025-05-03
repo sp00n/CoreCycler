@@ -306,6 +306,9 @@ suspendPeriodically = 1
 # Default:    On CPUs with more than 8 physical cores: 'Alternate'. Otherwise 'Random'
 # Alternate:  Alternate between the 1st core on CCD1, then 1st on CCD2, then 2nd on CCD1, then 2nd on CCD2, etc.
 #             This should distribute the heat more evenly and possibly allow for higher clocks on CPUs with 2 CCDs
+# CorePairs:  This will create "pairs" of cores, so e.g. core 0 - core 1, core 0 - core 2, ... core 0 - core max,
+#             up to core max - core 0, core max - core 1, core max - core max-1
+#             This allows for testing if there is any problem when switching from a specific core to another
 # Random:     A random order
 # Sequential: Cycle through the cores in numerical order
 #
@@ -13198,6 +13201,47 @@ try {
                 Write-VerboseText('The test order with the core moved to the front:')
                 Write-VerboseText($coreTestOrderArray -Join ', ')
             }
+        }
+
+        # Go through core combinations
+        # 0-1, 0-2, 0-3 ... 0-n, 1-0, 1-2, 1-3 ... 1-n, n-0, n-2, n-3 ... n-(n-1)
+        elseif ($coreTestOrderMode -eq 'corepairs') {
+            Write-VerboseText('Core Pairs test order selected, building the test order array...')
+            [System.Collections.ArrayList] $coreTestOrderArray = @()
+            
+            for ($currentMainCore = 0; $currentMainCore -lt $numPhysCores; $currentMainCore++) {
+                if ($settings.General.coresToIgnore.Contains($currentMainCore)) {
+                    continue
+                }
+
+                for ($curCore = 0; $curCore -lt $numPhysCores; $curCore++) {
+                    if ($curCore -eq $currentMainCore) {
+                        continue
+                    }
+
+                    if ($settings.General.coresToIgnore.Contains($curCore)) {
+                        continue
+                    }
+                    
+                    [Void] $coreTestOrderArray.Add($currentMainCore)
+                    [Void] $coreTestOrderArray.Add($curCore)
+                }
+            }
+
+            # If we had added a core from CoreFromAutoMode, push that core to the front
+            # Eventually this should be the pair that crashed, but currently we only support single cores
+            # TODO for a future revision
+            if ($useAutomaticTestModeWithResume -and $CoreFromAutoMode -gt -1) {
+                Write-VerboseText('Moving the passed core to the beginning of the test order')
+                Write-DebugText('Eventually this should be the core pair that failed, but we don''t support that yet')
+                [Void] $coreTestOrderArray.Insert(0, [Int] $_)
+            }
+
+            $numAvailableCores       = $coreTestOrderArray.Count
+            $numUniqueAvailableCores = @($coreTestOrderArray | Sort-Object | Get-Unique).Count
+
+            Write-DebugText('The core pairs test order:')
+            Write-DebugText($coreTestOrderArray -Join ', ')
         }
 
         # Custom

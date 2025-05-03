@@ -1,6 +1,7 @@
 .automode
 .updatecheck
 config.ini
+multiconfig-*.ini
 deploy.ps1
 _deploy
 *.git-credentials
