@@ -2,7 +2,7 @@
 .AUTHOR
     sp00n
 .VERSION
-    0.11.0.0alpha3
+    0.11.0.0alpha4
 .DESCRIPTION
     Sets the affinity of the selected stress test program process to only one
     core and cycles through all the cores which allows to test the stability of
@@ -23,7 +23,7 @@ param(
 
 
 # Our current version
-$version = '0.11.0.0alpha3'
+$version = '0.11.0.0alpha4'
 
 
 # This defines the strict mode
@@ -1327,7 +1327,7 @@ $stressTestPrograms = @{
         'absoluteInstallPath' = $null
         'fullPathToExe'       = $null
         'fullPathToLoadExe'   = $null
-        'command'             = 'cmd /C start /MIN "Linpack CoreCycler ' + $version + '" powershell.exe -Command "$Host.UI.RawUI.WindowTitle = ''Linpack CoreCycler ' + $version + '''; $PSDefaultParameterValues[''*:Encoding''] = ''utf8''; $env:OMP_NUM_THREADS = %OMP_NUM_THREADS%; %MKL_DEBUG_CPU_TYPE% $env:OMP_PLACES = ''CORES''; $env:OMP_PROC_BIND = ''SPREAD''; $env:MKL_DYNAMIC = ''FALSE''; $logFilePath = ''%logFilePath%''; if (!([IO.File]::Exists($logFilePath))) { [IO.File]::WriteAllLines($logFilePath, (Get-Date -Format HH:mm:ss)) }; & \"%fullPathToLoadExe%\" ''%configFilePath%'' | Tee-Object -FilePath $logFilePath -Append"'
+        'command'             = 'cmd /C start /MIN "Linpack CoreCycler ' + $version + '" powershell.exe -Command "$Host.UI.RawUI.WindowTitle = ''Linpack CoreCycler ' + $version + '''; $PSDefaultParameterValues[''*:Encoding''] = ''utf8''; $env:OMP_NUM_THREADS = %OMP_NUM_THREADS%; %MKL_DEBUG_CPU_TYPE% $env:OMP_PLACES = ''CORES''; $env:OMP_PROC_BIND = ''SPREAD''; $env:MKL_DYNAMIC = ''FALSE''; $logFilePath = ''%logFilePath%''; if (!([IO.File]::Exists($logFilePath))) { [IO.File]::WriteAllLines($logFilePath, (Get-Date -Format HH:mm:ss)) }; & ''%fullPathToLoadExe%'' ''%configFilePath%'' | ForEach-Object { $_; $_ | Out-File -LiteralPath $logFilePath -Append }"'   # Tee-Object has a bug with -LiteralPath and doesn't work with wildcards, so we use Out-File instead
         'windowBehaviour'     = 6
         'testModes'           = @(
             'SLOWEST'
@@ -2392,6 +2392,18 @@ function Exit-WithFatalError {
     Remove-AutoModeFile
 
 
+    # If we have output stored in the log buffer, write it now
+    $Script:canUseLogFile = $true
+
+    if ($logBuffer -and $logBuffer.Count -gt 0) {
+        forEach ($logEntry in $logBuffer) {
+            Write-LogEntry $logEntry
+        }
+
+        $logBuffer = $null
+    }
+
+
     Write-Host
     Write-Host
     Write-Host 'You can find more information in the log file:' -ForegroundColor Yellow
@@ -2414,31 +2426,93 @@ function Exit-WithFatalError {
 function Test-IsVisualCInstalled {
     $foundX86 = $false
     $foundX64 = $false
-    $regKeyEntries = Get-ChildItem 'HKLM:\SOFTWARE\WoW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    $registryKey1 = 'HKLM:\SOFTWARE\WoW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    $registryKey2 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
 
-    foreach ($entry in $regKeyEntries) {
-        $displayName = $entry.GetValue('DisplayName')
 
-        if ($displayName -match '^Microsoft Visual C\+\+\D*(?<Year>(\d|-){4,9}).*Redistributable.*') {
-            $name = $entry.GetValue('DisplayName')
-            $mainVersion = [Int] $entry.GetValue('VersionMajor')
-            $subVersion = [Int] $entry.GetValue('VersionMinor')
-            $isX64 = ($name -Match 'x64')
+    function Test-ForVisualCEntry {
+        param(
+            [Parameter(Mandatory=$true)] $RegistryKey,
+            [Parameter(Mandatory=$false)] [Switch] $WithOutput
+        )
 
-            # At least version 14.29 is required, for both x86 and x64
-            if ($mainVersion -ge 14 -and $subVersion -ge 29) {
-                if ($isX64) {
-                    $foundX64 = $true
+        if ($WithOutput.IsPresent) {
+            Write-DebugText('Test-ForVisualCEntry')
+            Write-DebugText($RegistryKey)
+        }
+
+        $registryEntries = Get-ChildItem -Path $RegistryKey -ErrorAction Ignore
+
+        foreach ($entry in $registryEntries) {
+            $displayName = $entry.GetValue('DisplayName')
+
+            if ($displayName -match '^Microsoft Visual C\+\+\D*(?<Year>(\d|-){4,9}).*(Redistributable|Minimum).*') {
+                $versionString = $entry.GetValue('DisplayVersion')
+                $mainVersion = [Int] $entry.GetValue('VersionMajor')
+                $subVersion = [Int] $entry.GetValue('VersionMinor')
+                $isX64 = ($displayName -Match 'x64')
+
+                # VersionMajor and VersionMinor may not exist
+                if ($mainVersion -eq 0 -and $subVersion -eq 0) {
+                    $versionArr = $versionString -Split '\.'
+
+                    if ($versionArr[0] -Match '^[\d\.]+$' -and $versionArr[1] -Match '^[\d\.]+$') {
+                        $mainVersion = [Int] $versionArr[0]
+                        $subVersion = [Int] $versionArr[1]
+                    }
                 }
-                else {
-                    $foundX86 = $true
+
+
+                if ($WithOutput.IsPresent) {
+                    Write-DebugText('Found:          ' + $displayName)
+                    Write-DebugText(' - mainVersion: ' + $mainVersion)
+                    Write-DebugText(' - subVersion:  ' + $subVersion)
+                    Write-DebugText(' - isX64:       ' + $isX64)
                 }
 
-                if ($foundX86 -and $foundX64) {
-                    break
+
+                # At least version 14.29 is required, for both x86 and x64
+                if ($mainVersion -ge 14 -and $subVersion -ge 29) {
+                    if ($isX64) {
+                        Set-Variable -Name 'foundX64' -Value $true -Scope 1
+
+                        if ($WithOutput.IsPresent) {
+                            Write-DebugText('Found x64')
+                        }
+                    }
+                    else {
+                        Set-Variable -Name 'foundX86' -Value $true -Scope 1
+
+                        if ($WithOutput.IsPresent) {
+                            Write-DebugText('Found x86')
+                        }
+                    }
+
+                    if ($foundX86 -and $foundX64) {
+                        return
+                    }
                 }
             }
         }
+    }
+
+
+    Test-ForVisualCEntry -RegistryKey $registryKey1
+
+    # Early return if found
+    if ($foundX86 -and $foundX64) {
+        return $true
+    }
+
+    # There's a secondary registry key for installed programs / libraries
+    Test-ForVisualCEntry -RegistryKey $registryKey2
+
+
+    # If we haven't found anything, list all the possible candidates
+    if (!$foundX86 -or !$foundX64) {
+        Write-DebugText('Visual C++ not found, listing possible candidates:')
+        Test-ForVisualCEntry -RegistryKey $registryKey1 -WithOutput
+        Test-ForVisualCEntry -RegistryKey $registryKey2 -WithOutput
     }
 
     return ($foundX86 -and $foundX64)
@@ -2461,7 +2535,7 @@ function Test-IsDotNetInstalled {
         return $false
     }
 
-    $installedVersions = Get-ChildItem $hasDotNetExe.Path.Replace('dotnet.exe', 'shared\Microsoft.NETCore.App') -ErrorAction Ignore | ForEach-Object {
+    $installedVersions = Get-ChildItem -LiteralPath $hasDotNetExe.Path.Replace('dotnet.exe', 'shared\Microsoft.NETCore.App') -ErrorAction Ignore | ForEach-Object {
         $_.Name
     }
 
@@ -3008,7 +3082,7 @@ function Get-PerformanceCounterIDs {
     )
 
     $key          = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib\009'
-    $allCounters  = (Get-ItemProperty -Path $key -Name Counter).Counter
+    $allCounters  = (Get-ItemProperty -LiteralPath $key -Name Counter).Counter
     $numCounters  = $allCounters.Count
     $countersHash = @{}
 
@@ -3584,7 +3658,7 @@ function Get-CpuFrequency {
 #>
 function Get-InitialLogLevel {
     # Check if the config.ini file exists
-    if (!(Test-Path $configUserPath -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $configUserPath -PathType Leaf)) {
         return $logLevel
     }
 
@@ -3596,7 +3670,7 @@ function Get-InitialLogLevel {
 
 
     # Check if there's a custom config file being used
-    $foundCustomConfigLine = Select-String -Path $configPath -Pattern $patternCustomConfig | Select-Object -Property Line -Last 1
+    $foundCustomConfigLine = Select-String -LiteralPath $configPath -Pattern $patternCustomConfig | Select-Object -Property Line -Last 1
 
     if ($foundCustomConfigLine) {
         $foundCustomConfigFile = $foundCustomConfigLine.Line -Match '=\s*(.+)'
@@ -3604,14 +3678,14 @@ function Get-InitialLogLevel {
         if ($foundCustomConfigFile -and $Matches[1]) {
             $configPathTemp = $PSScriptRoot + '\' + $Matches[1].Trim(' ', '"', '''', [Char]0x09)
 
-            if (Test-Path $configPathTemp -PathType Leaf) {
+            if (Test-Path -LiteralPath $configPathTemp -PathType Leaf) {
                 $configPath = $configPathTemp
             }
         }
     }
 
     # Check for the logLevel = n string
-    $foundLogLevelLine = Select-String -Path $configPath -Pattern $patternLogLevel | Select-Object -Property Line -Last 1
+    $foundLogLevelLine = Select-String -LiteralPath $configPath -Pattern $patternLogLevel | Select-Object -Property Line -Last 1
 
     if ($foundLogLevelLine) {
         $logLevelMatched = $foundLogLevelLine.Line -Match '=\s*(\d+)\s*'
@@ -3719,7 +3793,7 @@ function Start-UpdateCheckBackgroundJob {
 
 
         # Check the stored .updatecheck file
-        if (!(Test-Path $updateCheckFile -PathType Leaf)) {
+        if (!(Test-Path -LiteralPath $updateCheckFile -PathType Leaf)) {
             Write-DebugText('The .updatecheck file doesn''t exist, initiate online check')
             $doOnlineCheck = $true
         }
@@ -3980,7 +4054,7 @@ function Get-InitialUpdateCheckSetting {
 
 
     # Check if the config.ini file exists
-    if (!(Test-Path $configUserPath -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $configUserPath -PathType Leaf)) {
         return $returnObj
     }
 
@@ -3992,7 +4066,7 @@ function Get-InitialUpdateCheckSetting {
     $configPath = $configUserPath
 
     # Check if there's a custom config file being used
-    $foundCustomConfigLine = Select-String -Path $configPath -Pattern $patternCustomConfig | Select-Object -Property Line -Last 1
+    $foundCustomConfigLine = Select-String -LiteralPath $configPath -Pattern $patternCustomConfig | Select-Object -Property Line -Last 1
 
     # Set the path to the custom config file only if it's found
     if ($foundCustomConfigLine) {
@@ -4002,7 +4076,7 @@ function Get-InitialUpdateCheckSetting {
             $configPathTemp = $PSScriptRoot + '\' + $Matches[1].Trim(' ', '"', '''', [Char]0x09)
             Write-DebugText('Custom config file: ' + $configPathTemp)
 
-            if (Test-Path $configPathTemp -PathType Leaf) {
+            if (Test-Path -LiteralPath $configPathTemp -PathType Leaf) {
                 $configPath = $configPathTemp
             }
             else {
@@ -4013,7 +4087,7 @@ function Get-InitialUpdateCheckSetting {
 
 
     # Check for a enableUpdateCheck = n string
-    $foundUpdateCheckLine = Select-String -Path $configPath -Pattern $patternUpdateCheck | Select-Object -Property Line -Last 1
+    $foundUpdateCheckLine = Select-String -LiteralPath $configPath -Pattern $patternUpdateCheck | Select-Object -Property Line -Last 1
 
     # Disable it only if the value was found and is 0
     if ($foundUpdateCheckLine) {
@@ -4027,7 +4101,7 @@ function Get-InitialUpdateCheckSetting {
 
 
     # Also check for the update check frequency
-    $foundFrequencyLine = Select-String -Path $configPath -Pattern $patternUpdateFrequency | Select-Object -Property Line -Last 1
+    $foundFrequencyLine = Select-String -LiteralPath $configPath -Pattern $patternUpdateFrequency | Select-Object -Property Line -Last 1
 
     if ($foundFrequencyLine) {
         $foundFrequencyMatch = $foundFrequencyLine.Line -Match '=\s*(\d+\.?\d*)\s*'     # Allow decimal values
@@ -4055,7 +4129,7 @@ function Get-InitialUpdateCheckSetting {
 function Get-AutoModeFileContent {
     Write-DebugText('Parsing the .automode file')
 
-    if (!(Test-Path $autoModeFile -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $autoModeFile -PathType Leaf)) {
         throw('Could not find the .automode file!')
     }
 
@@ -4118,8 +4192,8 @@ function Set-AutoModeFile {
 
 
     # Remove the old file
-    if (Test-Path $autoModeFile -PathType Leaf) {
-        $null = Remove-Item -Path $autoModeFile -Force
+    if (Test-Path -LiteralPath $autoModeFile -PathType Leaf) {
+        $null = Remove-Item -LiteralPath $autoModeFile -Force
     }
 
 
@@ -4139,7 +4213,7 @@ function Set-AutoModeFile {
     # We save the file under a different name, and then rename it, which will hopefully trigger the file content flush to disk
     $null = New-Item $autoModeFileTemp -ItemType File -Force
 
-    if (!(Test-Path $autoModeFileTemp -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $autoModeFileTemp -PathType Leaf)) {
         Exit-WithFatalError -text 'Could not create the .automode-temp file!'
     }
 
@@ -4153,9 +4227,9 @@ function Set-AutoModeFile {
 
 
     # Now rename the file
-    $null = Rename-Item -Path $autoModeFileTemp -NewName $autoModeFile -Force
+    $null = Rename-Item -LiteralPath $autoModeFileTemp -NewName $autoModeFile -Force
 
-    if (!(Test-Path $autoModeFile -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $autoModeFile -PathType Leaf)) {
         Exit-WithFatalError -text 'Could not create the .automode file!'
     }
 }
@@ -4171,8 +4245,8 @@ function Set-AutoModeFile {
 function Remove-AutoModeFile {
     Write-DebugText('Removing the .automode file')
 
-    if (Test-Path $autoModeFile -PathType Leaf) {
-        Remove-Item -Path $autoModeFile
+    if (Test-Path -LiteralPath $autoModeFile -PathType Leaf) {
+        Remove-Item -LiteralPath $autoModeFile
     }
 }
 
@@ -4357,13 +4431,13 @@ function Import-Settings {
     )
 
     # Check if the file exists
-    if ($filePathOrDefault -ne 'DEFAULT' -and !(Test-Path $filePathOrDefault -PathType Leaf)) {
+    if ($filePathOrDefault -ne 'DEFAULT' -and !(Test-Path -LiteralPath $filePathOrDefault -PathType Leaf)) {
         Exit-WithFatalError -text ('Could not find ' + $filePathOrDefault + '!')
     }
 
     # Read the config file
     if ($filePathOrDefault -ne 'DEFAULT') {
-        $file = Get-ChildItem -Path $filePathOrDefault
+        $file = Get-ChildItem -LiteralPath $filePathOrDefault
         $reader = [System.IO.File]::OpenText($file)
         $settingsString = $reader.ReadToEnd()
         $reader.Close()
@@ -4627,10 +4701,10 @@ function Get-Settings {
 
 
     # If no config.ini file exists, copy the default values to the config.ini
-    if (!(Test-Path $configUserPath -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $configUserPath -PathType Leaf)) {
         [System.IO.File]::WriteAllLines($configUserPath, $DEFAULT_SETTINGS_STRING)
 
-        if (!(Test-Path $configUserPath -PathType Leaf)) {
+        if (!(Test-Path -LiteralPath $configUserPath -PathType Leaf)) {
             Exit-WithFatalError -text 'Could not create the config.ini file!'
         }
     }
@@ -4646,7 +4720,7 @@ function Get-Settings {
         Write-DebugText('Error when reading the user settings')
         Write-ColorText('WARNING: config.ini corrupted, replacing with default values!') Yellow
 
-        if (!(Test-Path $configDefaultPath -PathType Leaf)) {
+        if (!(Test-Path -LiteralPath $configDefaultPath -PathType Leaf)) {
             Exit-WithFatalError -text 'Neither config.ini nor default.config.ini found!'
         }
 
@@ -4663,7 +4737,7 @@ function Get-Settings {
         Write-Text($customConfigPath)
 
         try {
-            if (Test-Path $customConfigPath -PathType Leaf) {
+            if (Test-Path -LiteralPath $customConfigPath -PathType Leaf) {
                 # Overwrite the already parsed settings
                 $userSettings = Import-Settings $customConfigPath
 
@@ -4698,7 +4772,7 @@ function Get-Settings {
         Write-ColorText('WARNING: config.ini corrupted, replacing with default values!') Yellow
         Write-ColorText($_) Yellow
 
-        if (!(Test-Path $configDefaultPath -PathType Leaf)) {
+        if (!(Test-Path -LiteralPath $configDefaultPath -PathType Leaf)) {
             Exit-WithFatalError -text 'Neither config.ini nor default.config.ini found!'
         }
 
@@ -4904,7 +4978,7 @@ function Get-Settings {
             Write-DebugText('logFileCoreCycler: ' + $autoModeInfo['logFileCoreCycler'])
             #Write-DebugText('logFileStressTest: ' + $autoModeInfo['logFileStressTest'])
 
-            $Script:logFileName     = Split-Path -Path $autoModeInfo['logFileCoreCycler'] -Leaf
+            $Script:logFileName     = Split-Path -LiteralPath $autoModeInfo['logFileCoreCycler'] -Leaf
             $Script:logFileFullPath = $autoModeInfo['logFileCoreCycler']
             $Script:canUseLogFile   = $true
         }
@@ -6693,7 +6767,7 @@ function Test-Prime95 {
     Write-VerboseText('Checking if prime95.exe exists at:')
     Write-VerboseText($stressTestPrograms[$p95Type]['fullPathToExe'] + '.' + $stressTestPrograms[$p95Type]['processNameExt'])
 
-    if (!(Test-Path ($stressTestPrograms[$p95Type]['fullPathToExe'] + '.' + $stressTestPrograms[$p95Type]['processNameExt']) -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath ($stressTestPrograms[$p95Type]['fullPathToExe'] + '.' + $stressTestPrograms[$p95Type]['processNameExt']) -PathType Leaf)) {
         Write-ColorText('FATAL ERROR: Could not find Prime95!') Red
         Write-ColorText('Make sure to download and extract Prime95 into the following directory:') Red
         Write-ColorText($stressTestPrograms[$p95Type]['absoluteInstallPath']) Yellow
@@ -6718,7 +6792,7 @@ function Get-Prime95Version {
     # This may be prime95 or prime95_dev
     $p95Type = $settings.General.stressTestProgram
     Write-VerboseText('Checking the Prime95 version...')
-    $itemVersionInfo = (Get-Item ($stressTestPrograms[$p95Type]['fullPathToExe'] + '.' + $stressTestPrograms[$p95Type]['processNameExt'])).VersionInfo
+    $itemVersionInfo = (Get-Item -LiteralPath ($stressTestPrograms[$p95Type]['fullPathToExe'] + '.' + $stressTestPrograms[$p95Type]['processNameExt'])).VersionInfo
 
     $p95Version = $(
         $itemVersionInfo.ProductMajorPart,
@@ -7157,7 +7231,7 @@ function Initialize-Prime95 {
         $null = New-Item $configFile1 -ItemType File -Force
 
         # Check if the file exists
-        if (!(Test-Path $configFile1 -PathType Leaf)) {
+        if (!(Test-Path -LiteralPath $configFile1 -PathType Leaf)) {
             Exit-WithFatalError -text ('Could not create the config file at ' + $configFile1 + '!')
         }
     }
@@ -7168,18 +7242,18 @@ function Initialize-Prime95 {
         $configFile2 = $stressTestPrograms[$p95Type]['absolutePath'] + 'prime.txt'
 
         # Create the local.txt and overwrite if necessary
-        $null = New-Item $configFile1 -ItemType File -Force
+        $null = New-Item -Path $configFile1 -ItemType File -Force
 
         # Check if the file exists
-        if (!(Test-Path $configFile1 -PathType Leaf)) {
+        if (!(Test-Path -LiteralPath $configFile1 -PathType Leaf)) {
             Exit-WithFatalError -text ('Could not create the config file at ' + $configFile1 + '!')
         }
 
         # Create the prime.txt and overwrite if necessary
-        $null = New-Item $configFile2 -ItemType File -Force
+        $null = New-Item -Path $configFile2 -ItemType File -Force
 
         # Check if the file exists
-        if (!(Test-Path $configFile2 -PathType Leaf)) {
+        if (!(Test-Path -LiteralPath $configFile2 -PathType Leaf)) {
             Exit-WithFatalError -text ('Could not create the config file at ' + $configFile2 + '!')
         }
     }
@@ -7317,7 +7391,7 @@ function Initialize-Prime95 {
     [System.IO.File]::WriteAllLines($configFile1, $output1)
 
     # Check if the file exists
-    if (!(Test-Path $configFile1 -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $configFile1 -PathType Leaf)) {
         Exit-WithFatalError -text ('Could not create the config file at ' + $configFile1 + '!')
     }
 
@@ -7327,7 +7401,7 @@ function Initialize-Prime95 {
         [System.IO.File]::WriteAllLines($configFile2, $output2)
 
         # Check if the file exists
-        if (!(Test-Path $configFile2 -PathType Leaf)) {
+        if (!(Test-Path -LiteralPath $configFile2 -PathType Leaf)) {
             Exit-WithFatalError -text ('Could not create the config file at ' + $configFile2 + '!')
         }
     }
@@ -7507,7 +7581,7 @@ function Initialize-Aida64 {
     Write-VerboseText('Checking if aida64.exe exists at:')
     Write-VerboseText($stressTestPrograms['aida64']['fullPathToExe'] + '.' + $stressTestPrograms['aida64']['processNameExt'])
 
-    if (!(Test-Path ($stressTestPrograms['aida64']['fullPathToExe'] + '.' + $stressTestPrograms['aida64']['processNameExt']) -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath ($stressTestPrograms['aida64']['fullPathToExe'] + '.' + $stressTestPrograms['aida64']['processNameExt']) -PathType Leaf)) {
         Write-ColorText('FATAL ERROR: Could not find Aida64!') Red
         Write-ColorText('Make sure to download and extract the PORTABLE ENGINEER(!) version of Aida64 into the following directory:') Red
         Write-ColorText($stressTestPrograms['aida64']['absoluteInstallPath']) Yellow
@@ -7531,10 +7605,10 @@ function Initialize-Aida64 {
     $pathManifest = $stressTestPrograms['aida64']['processPath'] + '\aida64.exe.manifest'
     $pathBackup   = $stressTestPrograms['aida64']['processPath'] + '\aida64.exe.manifest.bak'
 
-    if ((Test-Path $pathManifest -PathType Leaf)) {
+    if ((Test-Path -LiteralPath $pathManifest -PathType Leaf)) {
         Write-VerboseText('Trying to rename the aida64.exe.manifest file so that we can start AIDA64 as a regular user')
 
-        if (!(Move-Item -Path $pathManifest -Destination $pathBackup -PassThru)) {
+        if (!(Move-Item -LiteralPath $pathManifest -Destination $pathBackup -PassThru)) {
             Exit-WithFatalError -text ('Could not rename the aida64.exe.manifest file!')
         }
 
@@ -7554,7 +7628,7 @@ function Initialize-Aida64 {
     $null = New-Item $configFile1 -ItemType File -Force
 
     # Check if the file exists
-    if (!(Test-Path $configFile1 -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $configFile1 -PathType Leaf)) {
         Exit-WithFatalError -text ('Could not create the config file at ' + $configFile1 + '!')
     }
 
@@ -7669,7 +7743,7 @@ function Initialize-Aida64 {
     [System.IO.File]::WriteAllLines($configFile1, $output1)
 
     # Check if the file exists
-    if (!(Test-Path $configFile1 -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $configFile1 -PathType Leaf)) {
         Exit-WithFatalError -text ('Could not create the config file at ' + $configFile1 + '!')
     }
 
@@ -7677,7 +7751,7 @@ function Initialize-Aida64 {
     [System.IO.File]::WriteAllLines($configFile2, $output2)
 
     # Check if the file exists
-    if (!(Test-Path $configFile2 -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $configFile2 -PathType Leaf)) {
         Exit-WithFatalError -text ('Could not create the config file at ' + $configFile2 + '!')
     }
 }
@@ -8078,7 +8152,7 @@ function Test-WhichYCruncherBinary {
         $command = $helpersPathAbsolute + 'WriteConsoleToWriteFileWrapper.exe'
         $filePath = $PSScriptRoot + '\' + $stressTestPrograms[$(if ($isYCruncherOld) { 'ycruncher_old' } else { 'ycruncher' })]['installPath'] + '\y-cruncher.exe'
         $arguments = 'pause:-2 colors:0 fake-invalid-command'
-        $finalArguments = $filePath + ' ' + $arguments + ' /dlllog:""'
+        $finalArguments = '"' + $filePath + '" ' + $arguments + ' /dlllog:""'
 
         Write-DebugText($command)
         Write-DebugText($finalArguments)
@@ -8168,7 +8242,7 @@ function Initialize-yCruncher {
     Write-VerboseText('Checking if ' + $binaryToRun + ' exists at:')
     Write-VerboseText($binaryWithPathToRun)
 
-    if (!(Test-Path ($binaryWithPathToRun) -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath ($binaryWithPathToRun) -PathType Leaf)) {
         Write-ColorText('FATAL ERROR: Could not find y-cruncher!') Red
         Write-ColorText('             Trying to run "' + $binaryWithPathToRun + '"') Red
         Write-ColorText('Make sure to download and extract y-cruncher into the following directory:') Red
@@ -8281,7 +8355,7 @@ function Initialize-yCruncher {
     [System.IO.File]::WriteAllLines($configFile, $configEntries)
 
     # Check if the file exists
-    if (!(Test-Path $configFile -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $configFile -PathType Leaf)) {
         Exit-WithFatalError -text ('Could not create the config file at ' + $configFile + '!')
     }
 }
@@ -8526,7 +8600,7 @@ function Initialize-Linpack {
     Write-VerboseText('Checking if ' + $binaryToRun + ' exists at:')
     Write-VerboseText($binaryWithPathToRun)
 
-    if (!(Test-Path ($binaryWithPathToRun) -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath ($binaryWithPathToRun) -PathType Leaf)) {
         Write-ColorText('FATAL ERROR: Could not find Linpack!') Red
         Write-ColorText('             Trying to run "' + $binaryWithPathToRun + '"') Red
 
@@ -8697,7 +8771,7 @@ function Initialize-Linpack {
     [System.IO.File]::WriteAllLines($configFile, $configEntries)
 
     # Check if the file exists
-    if (!(Test-Path $configFile -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $configFile -PathType Leaf)) {
         Exit-WithFatalError -text ('Could not create the config file at ' + $configFile + '!')
     }
 
@@ -8751,7 +8825,7 @@ function Start-Linpack {
     Write-DebugText('Trying to start the stress test with the command:')
     Write-DebugText($command)
 
-    # We're using Powershell to open the binary, since we can use the Tee-Object command to copy the output to a log file
+    # We're using Powershell to open the binary, so we can use the Out-File command to copy the output to a log file
     $processId = [Microsoft.VisualBasic.Interaction]::Shell($command, $windowBehaviour)
 
 
@@ -9116,7 +9190,7 @@ function Test-StressTestProgrammIsRunning {
         }
 
 
-        # Linpack also has a log file, created by Powershell's Tee-Object
+        # Linpack also has a log file, created by Powershell's Out-File
         elseif ($isLinpack) {
             Write-DebugText('           Checking the new Linpack log entries...')
 
@@ -10287,7 +10361,7 @@ function Get-NewLogfileEntries {
     $Script:newLogEntries = [System.Collections.ArrayList]::new()
 
     # Try to get the log file (e.g. results.txt for Prime95)
-    $resultFileHandle = Get-Item -Path $stressTestLogFilePath -ErrorAction Ignore
+    $resultFileHandle = Get-Item -LiteralPath $stressTestLogFilePath -ErrorAction Ignore
 
     # No file, no check
     if (!$resultFileHandle) {
@@ -11530,7 +11604,7 @@ function Test-CreateNewSystemRestorePoint {
             }
 
             # Alternatively
-            # Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -Name 'RPSessionInterval'
+            # Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -Name 'RPSessionInterval'
 
             # RPSessionInterval should be set to 1, even though the Windows doc says this is used for something else
             # https://learn.microsoft.com/en-us/windows/win32/sr/systemrestoreconfig
@@ -11624,12 +11698,12 @@ function Test-CreateNewSystemRestorePoint {
 
 # We need the logs and the configs directory to exist
 try {
-    if (!(Test-Path -Path $logFilePathAbsolute)) {
-        $null = New-Item $logFilePathAbsolute -ItemType Directory
+    if (!(Test-Path -LiteralPath $logFilePathAbsolute)) {
+        $null = New-Item -Path $logFilePathAbsolute -ItemType Directory
     }
 
-    if (!(Test-Path -Path $configsPathAbsolute)) {
-        $null = New-Item $configsPathAbsolute -ItemType Directory
+    if (!(Test-Path -LiteralPath $configsPathAbsolute)) {
+        $null = New-Item -Path $configsPathAbsolute -ItemType Directory
     }
 }
 catch {
@@ -11655,6 +11729,7 @@ if ($PSVersionTable.PSVersion.Major -gt 5) {
 }
 
 Write-VerboseText('Started the script at ' + $scriptStartDate.ToString('yyyy-MM-dd HH:mm:ss'))
+Write-VerboseText('Version: ' + $version)
 
 
 # Check the directory we're running from
@@ -11744,9 +11819,9 @@ if ($PSScriptRoot -Match '[^\x00-\x7F]') {
 
 
 # Check if .NET is installed
-$hasDotNet3_5 = (($dotNetEntry3_5 = Get-ItemProperty 'HKLM:\Software\Microsoft\NET Framework Setup\NDP\v3.5' -ErrorAction Ignore)        -and ($dotNetEntry3_5 | Get-Member Install) -and $dotNetEntry3_5.Install -eq 1)
-$hasDotNet4_0 = (($dotNetEntry4_0 = Get-ItemProperty 'HKLM:\Software\Microsoft\NET Framework Setup\NDP\v4.0\Client' -ErrorAction Ignore) -and ($dotNetEntry4_0 | Get-Member Install) -and $dotNetEntry4_0.Install -eq 1)
-$hasDotNet4_x = (($dotNetEntry4_x = Get-ItemProperty 'HKLM:\Software\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction Ignore)     -and ($dotNetEntry4_x | Get-Member Install) -and $dotNetEntry4_x.Install -eq 1)
+$hasDotNet3_5 = (($dotNetEntry3_5 = Get-ItemProperty -LiteralPath 'HKLM:\Software\Microsoft\NET Framework Setup\NDP\v3.5' -ErrorAction Ignore)        -and ($dotNetEntry3_5 | Get-Member Install) -and $dotNetEntry3_5.Install -eq 1)
+$hasDotNet4_0 = (($dotNetEntry4_0 = Get-ItemProperty -LiteralPath 'HKLM:\Software\Microsoft\NET Framework Setup\NDP\v4.0\Client' -ErrorAction Ignore) -and ($dotNetEntry4_0 | Get-Member Install) -and $dotNetEntry4_0.Install -eq 1)
+$hasDotNet4_x = (($dotNetEntry4_x = Get-ItemProperty -LiteralPath 'HKLM:\Software\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction Ignore)     -and ($dotNetEntry4_x | Get-Member Install) -and $dotNetEntry4_x.Install -eq 1)
 
 if (!$hasDotNet3_5 -and !$hasDotNet4_0 -and !$hasDotNet4_x) {
     Write-Host('')
@@ -11944,7 +12019,7 @@ try {
     Write-DebugText('--------------------------------------------------------------------------------')
     Write-DebugText('')
 
-    $configFile = Get-ChildItem -Path $configUserPath
+    $configFile = Get-ChildItem -LiteralPath $configUserPath
     $reader = [System.IO.File]::OpenText($configFile)
     $settingsString = $reader.ReadToEnd()
     $settingsArray = @($settingsString -Split '\r?\n')
@@ -11964,7 +12039,7 @@ try {
         Write-DebugText('--------------------------------------------------------------------------------')
         Write-DebugText('')
 
-        $configFile = Get-ChildItem -Path $customConfigPath
+        $configFile = Get-ChildItem -LiteralPath $customConfigPath
         $reader = [System.IO.File]::OpenText($configFile)
         $settingsString = $reader.ReadToEnd()
         $settingsArray = @($settingsString -Split '\r?\n')
@@ -12177,12 +12252,12 @@ try {
 
             # Get the content of the registry entry for the performance counters, both the English and the localized one
             $keyEnglish         = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib\009'
-            $allCountersEnglish = (Get-ItemProperty -Path $keyEnglish -Name Counter).Counter
+            $allCountersEnglish = (Get-ItemProperty -LiteralPath $keyEnglish -Name Counter).Counter
             $numCountersEnglish = $allCountersEnglish.Count
 
             # The localized performance counters
             $keyCurrent         = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib\CurrentLanguage'
-            $allCountersCurrent = (Get-ItemProperty -Path $keyCurrent -Name Counter).Counter
+            $allCountersCurrent = (Get-ItemProperty -LiteralPath $keyCurrent -Name Counter).Counter
             $numCountersCurrent = $allCountersCurrent.Count
 
             Write-DebugText('The number of counters for English:         ' + $numCountersEnglish)
@@ -13208,7 +13283,7 @@ try {
         elseif ($coreTestOrderMode -eq 'corepairs') {
             Write-VerboseText('Core Pairs test order selected, building the test order array...')
             [System.Collections.ArrayList] $coreTestOrderArray = @()
-            
+
             for ($currentMainCore = 0; $currentMainCore -lt $numPhysCores; $currentMainCore++) {
                 if ($settings.General.coresToIgnore.Contains($currentMainCore)) {
                     continue
@@ -13222,7 +13297,7 @@ try {
                     if ($settings.General.coresToIgnore.Contains($curCore)) {
                         continue
                     }
-                    
+
                     [Void] $coreTestOrderArray.Add($currentMainCore)
                     [Void] $coreTestOrderArray.Add($curCore)
                 }

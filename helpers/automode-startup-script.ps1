@@ -106,7 +106,7 @@ function Write-LogEntry {
 function Remove-StartupTask {
     Write-Text('Removing the startup task "' + $taskPath + '\' + $taskName + '"')
     Write-Text('')
-    Unregister-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Confirm:$false
+    Unregister-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 
@@ -219,7 +219,7 @@ try {
 
 
 
-    if (!(Test-Path $autoModeFile -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $autoModeFile -PathType Leaf)) {
         Write-Text('The .automode file does not exist!')
         Write-Text('The file is needed to be able to continue the testing process, aborting.')
         Write-Text('(Looking for: ' + $autoModeFile + ')')
@@ -275,7 +275,7 @@ try {
 
 
     # Try to use the log file
-    if (!(Test-Path $logFileCoreCycler -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $logFileCoreCycler -PathType Leaf)) {
         Write-Text('The CoreCycler log file doesn''t exist, generating')
         Write-Text('')
         $null = New-Item $logFileCoreCycler -ItemType File -Force
@@ -316,9 +316,10 @@ try {
 
     # Start the script now
     Write-Text('Command:')
-    Write-Text('Start-Process -PassThru -FilePath ''cmd.exe'' -ArgumentList @(''/C'', (''"' + $scriptRoot + '\Run CoreCycler.bat"''), ' + $lastCoreTested + ')')
+    Write-Text('Start-Process -PassThru -FilePath "' + $env:ComSpec + '" -WorkingDirectory "' + $env:SystemDrive + '" -ArgumentList @(''/C'', "' + $scriptRoot + '\Run CoreCycler.bat", ' + $lastCoreTested + ')')
 
-    $process = Start-Process -PassThru -FilePath 'cmd.exe' -ArgumentList @('/C', ('"' + $scriptRoot + '\Run CoreCycler.bat"'), $lastCoreTested)
+    # We need to set the working directory if the current path contains wildcard characters
+    $process = Start-Process -PassThru -FilePath "$env:ComSpec" -WorkingDirectory "$env:SystemDrive" -ArgumentList @('/C', ('"' + $scriptRoot + '\Run CoreCycler.bat"'), $lastCoreTested)
 }
 
 # Don't throw an error
