@@ -2,7 +2,7 @@
 .AUTHOR
     sp00n
 .VERSION
-    0.11.0.0alpha4
+    0.11.0.0alpha5
 .DESCRIPTION
     Sets the affinity of the selected stress test program process to only one
     core and cycles through all the cores which allows to test the stability of
@@ -23,7 +23,7 @@ param(
 
 
 # Our current version
-$version = '0.11.0.0alpha4'
+$version = '0.11.0.0alpha5'
 
 
 # This defines the strict mode
@@ -3898,7 +3898,7 @@ function Start-UpdateCheckBackgroundJob {
         # Make the request
         $content, $statusCode = try {
             [System.Net.ServicePointManager]::MaxServicePointIdleTime = 2000
-            $response = Invoke-WebRequest -Uri $updateCheckUrl -TimeoutSec 2 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri $updateCheckUrl -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
             $response.Content
             $response.StatusCode
         }
@@ -4262,15 +4262,24 @@ function Remove-AutoModeFile {
 function Add-AutoModeScheduledTask {
     Write-DebugText('Trying to add the Auto Mode startup task "' + $autoModeTaskPath + '\' + $autoModeTaskName + '"')
 
-    if (!$areWeAdmin) {
-        Write-DebugText('We are not admin, aborting')
-
-        Write-ColorText('FATAL ERROR: Could not add the scheduled startup task for the Automatic Mode, aborting!') Red
-        Exit-WithFatalError
-        return
-    }
-
     try {
+        if (!$areWeAdmin) {
+            Write-DebugText('We are not admin, aborting')
+            throw 'This action requires administrator rights'
+        }
+
+
+        $service = Get-Service -Name 'Schedule' -ErrorAction Ignore
+
+        if (!($service -and ($service | Get-Member Status))) {
+            throw 'The Task Scheduler ("Schedule") service could not be found'
+        }
+
+        if ($service.Status -ne 'Running') {
+            throw 'The Task Scheduler ("Schedule") service is not running'
+        }
+
+
         # If running when the user is not logged on, the account used might need Logon as Batch permission
         # To run without having logged in, you need to provide the password during creation, e.g. like this:
         # $cred = Get-Credential -Message "Enter Credentials"
@@ -4356,7 +4365,7 @@ function Add-AutoModeScheduledTask {
     }
     catch {
         Write-ColorText('FATAL ERROR: Could not add the scheduled startup task for the Automatic Mode, aborting!') Red
-        Write-ColorText($_) Red
+        Write-ColorText('     Reason: ' + $_) Red
         Exit-WithFatalError
     }
 }
@@ -7004,6 +7013,8 @@ function Initialize-Prime95 {
             41943040, 45875200, 52428800
         )
 
+        # Older AVX512 array, where I'm not sure anymore where it originally came from
+        <#
         AVX512 = @(
             # Smallest FFT
             4608, 5120, 6144, 7168, 7680, 8192, 9216, 10240, 10752, 12288, 12800, 16384, 18432, 20480,
@@ -7033,6 +7044,39 @@ function Initialize-Prime95 {
             24084480, 24772608, 25165824, 25690112, 26214400, 27525120, 28311552, 28901376, 29491200, 31457280, 32112640, 33030144, 33718272, 35389440,
             37748736, 38535168, 39321600, 41287680, 41943040, 42467328, 44040192, 47185920, 48168960, 49545216, 50331648, 51380224, 55050240, 56623104,
             57802752, 58720256, 62914560, 67108864
+        )
+        #>
+
+        # Newer AVX512 array, the limits for the individual presets may not 100% match those in Prime95
+        # Taken from a 9950X3D run
+        AVX512 = @(
+            # Smallest FFT
+            4608, 5120, 6144, 7168, 7680, 8192, 9216, 10240, 10752, 12288, 12800, 14336, 15360, 16384, 18432, 20480,
+
+            # Not used in Prime95 presets
+            24576, 25600, 30720, 32768, 36864,
+
+            # Small FFT
+            40960, 43008, 49152, 57344, 61440, 65536, 73728, 81920, 86016, 98304, 122880, 131072, 147456, 196608, 204800, 245760,
+
+            # Not used in Prime95 presets
+            294912, 307200, 327680, 344064, 368640, 393216, 409600, 442368,
+
+            # Large FFT
+            458752, 491520, 524288, 573440, 589824, 602112, 614400, 655360, 688128, 737280, 786432, 819200, 884736, 917504, 983040, 1048576, 1179648,
+            1228800, 1310720, 1376256, 1474560, 1572864, 1769472, 1966080, 2097152, 2359296, 2457600, 2621440, 2654208, 2752512, 2949120, 3145728,
+            3211264, 3276800, 3538944, 3670016, 3686400, 3932160, 4128768, 4194304, 4214784, 4300800, 4423680, 4718592, 4915200, 5160960, 5242880,
+            5308416, 5505024, 5734400, 5898240, 6021120, 6144000, 6193152, 6291456, 6422528, 6553600, 6881280, 7077888, 7225344, 7340032, 7372800,
+            7864320, 8257536, 8388608,
+
+            # Not used in Prime95 presets
+            # Now custom labeled "Huge"
+            # 65536K = 67108864 seems to be the maximum FFT size possible for AVX512
+            8601600, 8847360, 9175040, 9437184, 9633792, 9830400, 10321920, 10485760, 10616832, 11010048, 11468800, 11796480, 12288000, 12386304,
+            12582912, 13107200, 13762560, 14155776, 14745600, 15728640, 16056320, 16384000, 16515072, 17203200, 17694720, 18350080, 18874368, 19267584,
+            19660800, 20643840, 21233664, 22020096, 22937600, 23592960, 24084480, 24576000, 24772608, 25165824, 26214400, 27525120, 28311552, 29491200,
+            31457280, 32112640, 33030144, 34406400, 35389440, 36700160, 37748736, 38535168, 39321600, 41287680, 41943040, 42467328, 44040192, 47185920,
+            48168960, 49545216, 50331648, 51380224, 55050240, 56623104, 57802752, 58982400, 62914560, 67108864
         )
     }
 
@@ -7074,30 +7118,17 @@ function Initialize-Prime95 {
             HEAVYSHORT = @{ Min =    4096; Max =   163840; }
         }
 
+        # AVX512 I cannot test myself and have to rely on other people
         AVX512 = @{
-            SMALLEST   = @{ Min =    4608; Max =    21504; }  # Originally   4 ...   21
-            SMALL      = @{ Min =   40960; Max =   245760; }  # Originally  36 ...  248
-            LARGE      = @{ Min =  430080; Max =  8388608; }  # Originally 426 ... 8192
-            HUGE       = @{ Min = 8601600; Max = 67108864; }  # New addition
+            SMALLEST   = @{ Min =    4608; Max =    20480; }
+            SMALL      = @{ Min =   40960; Max =   245760; }
+            LARGE      = @{ Min =  458752; Max =  8388608; }
+            HUGE       = @{ Min = 8601600; Max = 67108864; }
             ALL        = @{ Min =    4608; Max = 67108864; }
             MODERATE   = @{ Min = 1376256; Max =  4194304; }
             HEAVY      = @{ Min =    4608; Max =  1376256; }
-            HEAVYSHORT = @{ Min =    4608; Max =   163840; }
+            HEAVYSHORT = @{ Min =    4608; Max =   196608; }
         }
-
-        # The limits have changed for Prime95 30.8
-        <#
-        AVX512 = @{
-            SMALLEST   = @{ Min =    4; Max =    42; }  # Originally   4 ...   42
-            SMALL      = @{ Min =   73; Max =   455; }  # Originally  73 ...  455
-            LARGE      = @{ Min =  780; Max =  8192; }  # Originally 780 ... 8192
-            HUGE       = @{ Min = 8400; Max = 65536; }  # New addition
-            ALL        = @{ Min =    4; Max = 65536; }
-            MODERATE   = @{ Min = 1344; Max =  4096; }
-            HEAVY      = @{ Min =    4; Max =  1344; }
-            HEAVYSHORT = @{ Min =    4; Max =   160; }
-        }
-        #>
     }
 
 
@@ -7139,10 +7170,13 @@ function Initialize-Prime95 {
         $Script:cpuTestMode = 'SSE'
 
         if ($settings.Prime95Custom.CpuSupportsAVX -eq 1) {
-            if ($settings.Prime95Custom.CpuSupportsAVX2 -eq 1 -and $settings.Prime95Custom.CpuSupportsFMA3 -eq 1) {
+            if ($settings.Prime95Custom.CpuSupportsAVX512 -eq 1 -and $settings.Prime95Custom.CpuSupportsAVX2 -eq 1 -and $settings.Prime95Custom.CpuSupportsFMA3 -eq 1) {
+                $Script:cpuTestMode = 'AVX512'
+            }
+            elseif ($settings.Prime95Custom.CpuSupportsAVX2 -eq 1 -and $settings.Prime95Custom.CpuSupportsFMA3 -eq 1) {
                 $Script:cpuTestMode = 'AVX2'
             }
-            else {
+            elseif ($settings.Prime95Custom.CpuSupportsFMA3 -eq 1) {
                 $Script:cpuTestMode = 'AVX'
             }
         }
