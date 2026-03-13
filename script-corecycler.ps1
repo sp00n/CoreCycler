@@ -46,6 +46,22 @@ $Host.UI.RawUI.WindowTitle = ('CoreCycler ' + $version + ' starting')
 Write-Host('Starting CoreCycler v' + $version + '...')
 Write-Host('Press CTRL+C to abort') -ForegroundColor Yellow
 
+# Single-instance enforcement using a named mutex so multiple launches
+# (bat, scheduled task or direct) will detect an existing instance.
+try {
+    $mutexName = 'Global\CoreCyclerSingleton'
+    $createdNew = $false
+    $Script:instanceMutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$createdNew)
+
+    if (-not $createdNew) {
+        Write-Host 'Another CoreCycler instance is already running.' -ForegroundColor Yellow
+        exit 1
+    }
+}
+catch {
+    Write-Warning ('Could not create single-instance mutex: ' + $_.Exception.Message)
+}
+
 
 
 # Global variables
@@ -2461,6 +2477,20 @@ function Exit-Script {
 
     Write-DebugText('Exiting with exit code: ' + $Script:exitCode)
 
+    # Release and dispose the single-instance mutex if present
+    if ($Script:instanceMutex) {
+        try {
+            # Only release if we own it; ReleaseMutex may throw otherwise
+            $Script:instanceMutex.ReleaseMutex() | Out-Null
+        }
+        catch {
+            # Ignore release errors
+        }
+
+        try { $Script:instanceMutex.Dispose() } catch {}
+        $Script:instanceMutex = $null
+    }
+
     exit $Script:exitCode
 }
 
@@ -2515,6 +2545,19 @@ function Exit-WithFatalError {
     Write-Host 'You can find more information in the log file:' -ForegroundColor Yellow
     Write-Host $logFileFullPath -ForegroundColor Cyan
     Write-Host 'When reporting this error, please provide this log file.' -ForegroundColor Yellow
+
+    # Release and dispose the single-instance mutex if present
+    if ($Script:instanceMutex) {
+        try {
+            $Script:instanceMutex.ReleaseMutex() | Out-Null
+        }
+        catch {
+            # Ignore release errors
+        }
+
+        try { $Script:instanceMutex.Dispose() } catch {}
+        $Script:instanceMutex = $null
+    }
 
     Read-Host -Prompt 'Press Enter to exit'
     exit $Script:exitCode
