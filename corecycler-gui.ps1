@@ -419,7 +419,7 @@ $yCruncherGroup = [System.Windows.Forms.GroupBox]::new(); $yCruncherGroup.Text =
 $stressLayout.Controls.Add($yCruncherGroup)
 $yCruncherInner = [System.Windows.Forms.TableLayoutPanel]::new(); $yCruncherInner.AutoSize = $true; $yCruncherInner.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink; $yCruncherInner.ColumnCount = 2; $yCruncherInner.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::AutoSize)) | Out-Null; $yCruncherInner.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 100)) | Out-Null
 $yCruncherGroup.Controls.Add($yCruncherInner)
-$controls.yCruncherMode = [System.Windows.Forms.ComboBox]::new(); $controls.yCruncherMode.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList; $controls.yCruncherMode.Items.AddRange(([string[]]@('00-x86','01-x64','02-AVX','03-AVX2'))); $controls.yCruncherMode.Width = 140
+$controls.yCruncherMode = [System.Windows.Forms.ComboBox]::new(); $controls.yCruncherMode.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList; $controls.yCruncherMode.Items.AddRange(([string[]]@('00-x86','04-P4P','05-A64 ~ Kasumi','08-NHM ~ Ushio','11-SNB ~ Hina','12-BD2 ~ Miyu','13-HSW ~ Airi','14-BDW ~ Kurumi','17-SKX ~ Kotori','17-ZN1 ~ Yukina','18-CNL ~ Shinoa','19-ZN2 ~ Kagari','22-ZN4 ~ Kizuna','24-ZN5 ~ Komari'))); $controls.yCruncherMode.Width = 140
 Set-ComboBoxValue -Control $controls.yCruncherMode -Value (Get-SettingValue -Sections $sections -Section 'yCruncher' -Key 'mode' -DefaultValue '00-x86') -DefaultValue '00-x86'
 Add-SettingRow -Panel $yCruncherInner -LabelText 'Mode' -Control $controls.yCruncherMode -RowIndex 0
 $controls.yCruncherTests = [System.Windows.Forms.TextBox]::new(); $controls.yCruncherTests.Width = 420; $controls.yCruncherTests.Text = (Get-SettingValue -Sections $sections -Section 'yCruncher' -Key 'tests' -DefaultValue 'BKT, BBP, SFTv4, SNT, SVT, FFTv4, N63, VT3')
@@ -548,7 +548,7 @@ $controls.modeToUseForSuspension = [System.Windows.Forms.ComboBox]::new(); $cont
 Set-ComboBoxValue -Control $controls.modeToUseForSuspension -Value (Get-SettingValue -Sections $sections -Section 'Debug' -Key 'modeToUseForSuspension' -DefaultValue 'Threads') -DefaultValue 'Threads'
 Add-SettingRow -Panel $debugInner -LabelText 'Suspension mode' -Control $controls.modeToUseForSuspension -RowIndex 8
 
-$advancedPage = [System.Windows.Forms.TabPage]::new(); $advancedPage.Text = 'Expert / Advanced'
+$advancedPage = [System.Windows.Forms.TabPage]::new(); $advancedPage.Text = 'Prime95 Custom'
 $advancedPage.Padding = [System.Windows.Forms.Padding]::new(12)
 $tabControl.TabPages.Add($advancedPage)
 
