@@ -439,6 +439,8 @@ lookForWheaErrors = 1
 # The testing on the core will be stopped and continued on the next one
 # However only if the APIC ID from the WHEA message matches the core that was currently tested, otherwise
 # only a warning will be displayed
+# Some WHEA entries don't contain an APIC ID at all (e.g. a corrected memory error). As the tested core cannot be
+# ruled out for those, they are also treated as an error
 #
 # Default: 1
 treatWheaWarningAsError = 1
@@ -9510,14 +9512,26 @@ function Test-StressTestProgrammIsRunning {
                 Write-DebugText('The core extracted APIC ID from the WHEA message: ' + $apicIdFromWheaMessage)
                 Write-DebugText('The core extracted from the WHEA message:         ' + $coreFromWheaMessage)
 
+                # A negative value means that the entry didn't contain the information, don't display it as a number
+                $apicIdString = $(if ($apicIdFromWheaMessage -lt 0) { 'not available' } else { $apicIdFromWheaMessage.ToString() })
+                $coreIdString = $(if ($coreFromWheaMessage -lt 0)   { 'not available' } else { $coreFromWheaMessage.ToString() })
+
 
                 # Depending on the settings, this is either a warning or an error
-                # However it is only an error if the core matches the APIC ID
+                # However it is only an error if the core matches the APIC ID, or if the APIC ID is not available at all
                 if ($settings.General.treatWheaWarningAsError -gt 0) {
                     if ($actualCoreNumber -eq $coreFromWheaMessage) {
                         Write-DebugText('The core from the WHEA message matches the tested core (' + $coreNumber + ' = ' + $coreFromWheaMessage + ')')
 
                         $stressTestError = 'There has been a WHEA error while running this test and the setting to treat this as an error has been set!'
+                        $errorType = 'WHEAERROR'
+                    }
+
+                    # No core in the WHEA message, so we cannot rule out that the tested core has caused it
+                    elseif ($coreFromWheaMessage -lt 0) {
+                        Write-DebugText('The WHEA message does not contain a core, treating it as an error for the tested core')
+
+                        $stressTestError = 'There has been a WHEA error while running this test and the setting to treat this as an error has been set! The WHEA entry does not contain the core that caused it, so the tested core cannot be ruled out.'
                         $errorType = 'WHEAERROR'
                     }
 
@@ -9531,7 +9545,7 @@ function Test-StressTestProgrammIsRunning {
                         Write-ColorText('WARNING: The flag to treat this as an error has been set, but the APIC ID from the WHEA message does not match the tested core!') Magenta
                         Write-ColorText('WHEA TIMESTAMP: ' + $lastWheaError.TimeCreated.ToString()) Magenta
                         Write-ColorText('WHEA EVENT ID:  ' + $lastWheaError.Id) Magenta
-                        Write-ColorText('WHEA APIC ID:   ' + $apicIdFromWheaMessage) Magenta
+                        Write-ColorText('WHEA APIC ID:   ' + $apicIdString) Magenta
                         Write-ColorText('WHEA MESSAGE:   ' + $firstMessagEntry) Magenta
 
                         $wheaMessageArray | ForEach-Object {
@@ -9547,7 +9561,7 @@ function Test-StressTestProgrammIsRunning {
                     Write-ColorText('WARNING: At Core ' + $coreString) Magenta
                     Write-ColorText('WHEA TIMESTAMP:  ' + $lastWheaError.TimeCreated.ToString()) Magenta
                     Write-ColorText('WHEA EVENT ID:   ' + $lastWheaError.Id) Magenta
-                    Write-ColorText('WHEA APIC ID:    ' + $apicIdFromWheaMessage) Magenta
+                    Write-ColorText('WHEA APIC ID:    ' + $apicIdString) Magenta
                     Write-ColorText('WHEA MESSAGE:    ' + $firstMessagEntry) Magenta
 
                     $wheaMessageArray | ForEach-Object {
@@ -9561,8 +9575,8 @@ function Test-StressTestProgrammIsRunning {
                     $errorString  = 'Timestamp: ' + $lastWheaError.TimeCreated.ToString()
                     $errorString += [Environment]::NewLine + 'WHEA Record Id: ' + $lastWheaError.RecordId.ToString()
                     $errorString += [Environment]::NewLine + 'WHEA Event Id: ' + $lastWheaError.Id.ToString()
-                    $errorString += [Environment]::NewLine + 'APIC ID: ' + $apicIdFromWheaMessage
-                    $errorString += [Environment]::NewLine + 'APIC ID converted to Core: ' + $coreFromWheaMessage
+                    $errorString += [Environment]::NewLine + 'APIC ID: ' + $apicIdString
+                    $errorString += [Environment]::NewLine + 'APIC ID converted to Core: ' + $coreIdString
                     $errorString += [Environment]::NewLine + 'CoreCycler was running on Core: ' + $coreNumber
                     $errorString += [Environment]::NewLine + [Environment]::NewLine + 'Message: ' + $lastWheaError.Message
 
@@ -10008,10 +10022,10 @@ function Test-StressTestProgrammIsRunning {
 
     # A WHEA Error
     if ($errorType -eq 'WHEAERROR') {
-        Write-ColorText('ERROR: At Core ' + $coreString + ' (APIC ID ' + $apicIdFromWheaMessage + ' = Core ' + $coreFromWheaMessage + ')') Magenta
+        Write-ColorText('ERROR: At Core ' + $coreString + ' (APIC ID ' + $apicIdString + ' = Core ' + $coreIdString + ')') Magenta
         Write-ColorText('WHEA TIMESTAMP: ' + $lastWheaError.TimeCreated.ToString()) Magenta
         Write-ColorText('WHEA EVENT ID:  ' + $lastWheaError.Id) Magenta
-        Write-ColorText('WHEA APIC ID:   ' + $apicIdFromWheaMessage) Magenta
+        Write-ColorText('WHEA APIC ID:   ' + $apicIdString) Magenta
     }
 
 
@@ -11564,6 +11578,15 @@ function Convert-WheaMessageToCoreId {
 
     # The apicId represents the logical core, i.e. the virtual CPU
     $apicId = Convert-WheaMessageToApicId $wheaErrorEntry
+
+    # Some WHEA entries don't contain a processor reference at all (e.g. a corrected memory error), for those the
+    # APIC ID cannot be determined and neither can the core
+    # Note that a hash table lookup with a key that doesn't exist returns $null, which would be cast to core 0 here,
+    # so we need to check this explicitly
+    if ($apicId -lt 0 -or !$coresInfo['apicIdToCore'].ContainsKey($apicId)) {
+        Write-DebugText('The APIC ID ' + $apicId + ' could not be resolved to a core')
+        return -1
+    }
 
     # Convert this to a physical core
     $coreId = [Int] $coresInfo['apicIdToCore'][$apicId]
