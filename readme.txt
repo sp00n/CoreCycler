@@ -69,6 +69,82 @@ setting in the config.ini to enable testing with two threads as well.
 
 
 
+AUTOMATIC TEST MODE
+-------------------
+Instead of adjusting the Curve Optimizer values by hand after every error, you can let CoreCycler do it for you.
+Enable it with "enableAutomaticAdjustment = 1" in the [AutomaticTestMode] section of your config file, or use one of
+the ready made config files in the /configs/ directory (Ryzen.AutomaticTestMode.Start.ini resp.
+Intel.AutomaticTestMode.yCruncher.ini).
+Note that this requires administrator privileges, and for Ryzen processors it also requires PawnIO to be installed
+(https://pawnio.eu/), as it uses the included "ryzen-smu-cli" to apply the Curve Optimizer values. For Intel it uses
+the included "IntelVoltageControl", which sets a single voltage offset for all of the cores.
+
+How it works:
+- It starts with the values from the "startValues" setting. For Ryzen you can use "Minimum" here, which selects the
+  lowest possible Curve Optimizer value of your processor (-30 for Ryzen 5000, -50 for Ryzen 7000 and upwards).
+- Whenever a core throws an error, its value is made less aggressive by the "incrementBy" amount, and the counter of
+  error free test runs for this core starts over.
+- Once a core has completed "passesToConfirmCoreValue" test runs in a row without an error at the same value, this
+  value is considered good. The core is then not tested again, not even after an automatic resume.
+- If a core still throws an error once it has reached the "maxValue" setting, no stable value could be found for it.
+  It will not be tested again either, and it will be listed as "could not be stabilized" in the summary.
+- The test keeps running until every core has either found a good value or has reached the "maxValue" setting.
+  The "maxIterations" setting from the [General] section is NOT used in the Automatic Test Mode.
+- By default the script stays on a core until that core has a final value ("repeatCoreUntilConfirmed"), so one core
+  is finished after the other. If you set this to 0, each core is tested once per iteration and the whole test order
+  is cycled through repeatedly instead, which spreads the test runs for a core over a longer period of time.
+  Either way, the order in which the cores are selected is the one from the "coreTestOrder" setting.
+
+The results:
+Every found value is immediately written to a "*_automode-results.txt" file in the /logs/ directory, next to the
+regular log file. This file is never overwritten and also survives a crash or a reboot, so you always have the
+values that were found up to that point.
+At the end of the file (and in the summary at the end of a run) you will also find a ready to use line like this:
+   knownGoodValues = 0:-22, 1:-19, 2:-25, ...
+You can copy this into the [AutomaticTestMode] section of your config file. The cores listed there will then be
+treated as already finished and will not be tested again, which is handy if you want to continue a test run later on
+or if you want to test only the remaining cores.
+
+   NOTE: The "knownGoodValues" setting only works for Ryzen processors. For Intel there currently is only a single
+         voltage offset for all of the cores, so per core values make no sense, and CoreCycler will abort with an
+         error message if you use this setting on an Intel processor.
+
+IMPORTANT: CoreCycler does NOT store the Curve Optimizer / voltage offset values permanently! They are only applied
+           for the current Windows session. To keep them, you need to set them in your BIOS, or apply them on every
+           Windows start with a tool such as PBO2 Tuner or with the included ryzen-smu-cli.
+
+Resuming after a crash:
+An unstable Curve Optimizer setting will usually not produce a nice error message, it will crash or freeze the
+computer instead. With "enableResumeAfterUnexpectedExit = 1", CoreCycler creates a Scheduled Task that tries to
+continue the test process after the reboot. It will retest the core that was being tested when the crash happened
+(with an adjusted value) and then continue with the cores that had not been tested yet in that iteration - it does
+not start the whole test order from the beginning again.
+
+   NOTE: The Scheduled Task is executed when you log on, so for a truly unattended test run you should enable
+         Windows Auto Logon. Otherwise the computer will just sit at the logon screen after a crash.
+         https://learn.microsoft.com/en-us/sysinternals/downloads/autologon
+   NOTE: On some systems, especially Ryzen 9000 systems, an unstable Curve Optimizer setting does not reboot the
+         computer, it just freezes it. In that case nothing can resume automatically and you have to restart the
+         computer yourself. All of the values that were found up to that point are still in the results file.
+   NOTE: If the computer keeps crashing right after a resume, so that not a single core can be tested anymore and no
+         value can be increased anymore, CoreCycler gives up after a couple of attempts, removes the Scheduled Task
+         and aborts, instead of letting the computer reboot over and over again.
+   NOTE: Always exit CoreCycler with CTRL+C. If you just close the window, the Scheduled Task will remain and will
+         be executed on the next reboot.
+
+Other notes:
+- Because a crash cannot be attributed to a specific core with certainty, it is highly recommended to also enable
+  "setVoltageOnlyForTestedCore", so that all of the other cores run at a safe value while one core is being tested.
+  With this setting, cores that already have a good value are also set to the safe value - if you want to test the
+  combination of all of the found values instead, enable "applyConfirmedValuesForNotTestedCores".
+- There is an internal safety limit for the number of test runs per core, which cannot be configured. If a core
+  exceeds it (which should never happen), it is treated as "could not be stabilized" and the run continues with the
+  remaining cores.
+- Using the Automatic Test Mode with very aggressive starting values can corrupt your Windows installation, so
+  creating a System Restore Point beforehand is highly recommended ("createSystemRestorePoint", enabled by default).
+
+
+
 INCLUDED SOFTWARE
 -----------------
 The script itself is a PowerShell script, but it uses other, inlcuded software to do the actual stress testing, for
