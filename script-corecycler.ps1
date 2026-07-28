@@ -4999,7 +4999,7 @@ function Initialize-AutoModeResultsFile {
         $Script:autoModeResultsFileFullPath = $logFilePathAbsolute + $autoModeResultsFileName
     }
     else {
-        $Script:autoModeResultsFileName = Split-Path -LiteralPath $autoModeResultsFileFullPath -Leaf
+        $Script:autoModeResultsFileName = [System.IO.Path]::GetFileName($autoModeResultsFileFullPath)
     }
 
     Write-DebugText('The Automatic Test Mode results file: ' + $autoModeResultsFileFullPath)
@@ -6270,7 +6270,7 @@ function Get-Settings {
             Write-DebugText('logFileCoreCycler: ' + $autoModeInfo['logFileCoreCycler'])
             #Write-DebugText('logFileStressTest: ' + $autoModeInfo['logFileStressTest'])
 
-            $Script:logFileName     = Split-Path -LiteralPath $autoModeInfo['logFileCoreCycler'] -Leaf
+            $Script:logFileName     = [System.IO.Path]::GetFileName($autoModeInfo['logFileCoreCycler'])
             $Script:logFileFullPath = $autoModeInfo['logFileCoreCycler']
             $Script:canUseLogFile   = $true
         }
