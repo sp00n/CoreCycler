@@ -191,6 +191,7 @@ $autoModeResultsFileFullPath             = ''
 $autoModeResultsFooterWritten            = $false
 $coreStates                              = @{}
 $passesToConfirmCoreValue                = 3
+$repeatCoreUntilConfirmed                = $true
 $maxTestsPerCoreSanityLimit              = 0
 $knownGoodValues                         = @{}
 $applyConfirmedValuesForNotTestedCores   = $false
@@ -864,6 +865,25 @@ incrementBy = Default
 #
 # Default: 3
 passesToConfirmCoreValue = 3
+
+
+# Stay on a core until it has a final value, instead of continuing with the next core after each test run
+# With this enabled, a core is tested over and over again until it has collected its "passesToConfirmCoreValue"
+# error free test runs, or until it has reached the "maxValue" setting. Only then the next core in line is selected
+# This finishes one core after the other, so you already have final values for the cores that have been tested if
+# you abort the run early
+# If you set this to 0, each core is tested once per iteration and the test order is cycled through repeatedly, which
+# spreads the test runs for a core over a longer period of time
+#
+# Note: This does not change the order in which the cores are selected, see the "coreTestOrder" setting for that
+# Note: For the behavior after an error, see the "repeatCoreOnError" setting below
+# Note: For Intel up to 14th gen there is only one voltage offset for all of the cores. A core that is confirmed
+#       early therefore keeps the value it was confirmed with, even if a later core makes the shared value less
+#       aggressive. Setting this to 0 is the better choice there, as it lets all of the cores collect their test
+#       runs at the same value
+#
+# Default: 1
+repeatCoreUntilConfirmed = 1
 
 
 # Set only the currently tested core to the selected Curve Optimizer / voltage offset value
@@ -4997,6 +5017,7 @@ function Initialize-AutoModeResultsFile {
     $settingsString     += ' | maxValue = ' + $settings['AutomaticTestMode']['maxValue']
     $settingsString     += ' | incrementBy = ' + $settings['AutomaticTestMode']['incrementBy']
     $settingsString     += ' | passesToConfirmCoreValue = ' + $passesToConfirmCoreValue
+    $settingsString     += ' | repeatCoreUntilConfirmed = ' + $(if ($repeatCoreUntilConfirmed) { '1' } else { '0' })
 
     Write-AutoModeResultEntry -text ('CoreCycler Automatic Test Mode - ' + $autoModeDescription + ' results') -NoLogEntry
     Write-AutoModeResultEntry -text ('Started:   ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) -NoLogEntry
@@ -5305,12 +5326,18 @@ function Set-CoreState {
     If enough consecutive passes have been collected, the value for this core is considered confirmed
 .PARAMETER coreNumber
     [Int] The core that has completed a test run
+.PARAMETER coreTestOrderArray
+    [System.Collections.ArrayList] The array of the cores being tested. We're modifying this if repeatCoreUntilConfirmed is set
+.PARAMETER coreIndex
+    [Ref] The current core index. We're modifying this if repeatCoreUntilConfirmed is set
 .OUTPUTS
     [Void]
 #>
 function Add-CorePass {
     param(
-        [Parameter(Mandatory=$true)] [Int] $coreNumber
+        [Parameter(Mandatory=$true)] [Int] $coreNumber,
+        [Parameter(Mandatory=$false)][AllowEmptyCollection()] [System.Collections.ArrayList] $coreTestOrderArray,
+        [Parameter(Mandatory=$false)] $coreIndex
     )
 
     if (!$useAutomaticTestMode -or !$coreStates.ContainsKey($coreNumber)) {
@@ -5334,6 +5361,21 @@ function Add-CorePass {
     }
 
     Write-ColorText('           Core ' + $coreNumber + ': ' + $thisCoreState['passes'] + '/' + $passesToConfirmCoreValue + ' confirmation passes at a ' + $autoModeDescription + ' value of ' + $thisValue) Cyan
+
+    # Stay on this core until it has a final value, instead of continuing with the next core in line
+    # This works the same way as the repeatCoreOnError setting: the core has already been removed from the test order
+    # array before the test started, so we put it back to the front and undo the increment of the loop index
+    if ($repeatCoreUntilConfirmed -and $null -ne $coreIndex) {
+        Write-DebugText('Core test order array before: ' + $coreTestOrderArray)
+
+        [Void] $coreTestOrderArray.Insert(0, $coreNumber)
+
+        Write-DebugText('Core test order array after:  ' + $coreTestOrderArray)
+
+        # This sets the index to the one before this core, so it should fall on the same core again when we continue the loop
+        # This variable was passed as a reference, so we need to access the .Value property
+        $coreIndex.Value--
+    }
 
     # No -coreNumber here, a completed pass must not change the core that is currently being tested
     Save-AutoModeState
@@ -6561,6 +6603,7 @@ function Initialize-AutomaticTestMode {
 
     # How many test runs in a row without an error a core needs to be considered "good"
     $Script:passesToConfirmCoreValue              = [Math]::Max(1, [Int] $settings.AutomaticTestMode.passesToConfirmCoreValue)
+    $Script:repeatCoreUntilConfirmed              = ($settings.AutomaticTestMode.repeatCoreUntilConfirmed -gt 0)
     $Script:applyConfirmedValuesForNotTestedCores = ($settings.AutomaticTestMode.applyConfirmedValuesForNotTestedCores -gt 0)
 
 
@@ -14369,6 +14412,7 @@ try {
         }
 
         Write-SettingIntroText -Text 'Passes to confirm a value'            -Setting ($passesToConfirmCoreValue)
+        Write-SettingIntroText -Text 'Stay on a core until it is confirmed' -Setting ($(if ($repeatCoreUntilConfirmed) { 'ENABLED' } else { 'DISABLED' }))
 
         if ($knownGoodValues.Count -gt 0) {
             Write-SettingIntroText -Text 'Known good values (not tested)'    -Setting (Get-ConfirmedValuesString -OnlyFromConfig)
@@ -15765,7 +15809,7 @@ try {
 
                             # This core has completed a test run without an error
                             if ($useAutomaticTestMode) {
-                                Add-CorePass $actualCoreNumber
+                                Add-CorePass -coreNumber $actualCoreNumber -coreTestOrderArray $coreTestOrderArray -coreIndex ([Ref] $coreIndex)
                             }
 
                             continue LoopCoreRunner
@@ -16003,7 +16047,7 @@ try {
 
                             # This core has completed a test run without an error
                             if ($useAutomaticTestMode) {
-                                Add-CorePass $actualCoreNumber
+                                Add-CorePass -coreNumber $actualCoreNumber -coreTestOrderArray $coreTestOrderArray -coreIndex ([Ref] $coreIndex)
                             }
 
                             continue LoopCoreRunner
@@ -16105,7 +16149,7 @@ try {
 
             # This core has completed a test run without an error
             if ($useAutomaticTestMode) {
-                Add-CorePass $actualCoreNumber
+                Add-CorePass -coreNumber $actualCoreNumber -coreTestOrderArray $coreTestOrderArray -coreIndex ([Ref] $coreIndex)
             }
         }   # End: :LoopCoreRunner for ($coreIndex = 0; $coreIndex -lt $numAvailableCores; $coreIndex++)
 

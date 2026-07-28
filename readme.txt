@@ -90,6 +90,10 @@ How it works:
   It will not be tested again either, and it will be listed as "could not be stabilized" in the summary.
 - The test keeps running until every core has either found a good value or has reached the "maxValue" setting.
   The "maxIterations" setting from the [General] section is NOT used in the Automatic Test Mode.
+- By default the script stays on a core until that core has a final value ("repeatCoreUntilConfirmed"), so one core
+  is finished after the other. If you set this to 0, each core is tested once per iteration and the whole test order
+  is cycled through repeatedly instead, which spreads the test runs for a core over a longer period of time.
+  Either way, the order in which the cores are selected is the one from the "coreTestOrder" setting.
 
 The results:
 Every found value is immediately written to a "*_automode-results.txt" file in the /logs/ directory, next to the
