@@ -2,7 +2,7 @@
 .AUTHOR
     sp00n
 .VERSION
-    0.11.0.4
+    0.11.1.0
 .DESCRIPTION
     Sets the affinity of the selected stress test program process to only one
     core and cycles through all the cores which allows to test the stability of
@@ -23,7 +23,7 @@ param(
 
 
 # Our current version
-$version = '0.11.0.4'
+$version = '0.11.1.0'
 
 
 # This defines the strict mode
@@ -180,10 +180,29 @@ $pboCliTool                              = $PSScriptRoot + '\tools\ryzen-smu-cli
 $intelCliTool                            = $PSScriptRoot + '\tools\IntelVoltageControl\IntelVoltageControl.exe'
 $autoModeFile                            = $PSScriptRoot + '\.automode'
 $autoModeFileTemp                        = $PSScriptRoot + '\.automode-temp'
+$autoModeFileBak                         = $PSScriptRoot + '\.automode-bak'
 $autoModeStartupScriptFile               = $PSScriptRoot + '\helpers\automode-startup-script.ps1'
 $autoModeTaskName                        = 'CoreCycler AutoMode Startup Task'
 $autoModeTaskPath                        = '\CoreCycler\'
 $autoModeTaskDescription                 = 'CoreCycler Automatic Test Mode Startup Script'
+$autoModeSchemaVersion                   = 2
+$autoModeResultsFileName                 = ''
+$autoModeResultsFileFullPath             = ''
+$autoModeResultsFooterWritten            = $false
+$coreStates                              = @{}
+$passesToConfirmCoreValue                = 3
+$maxTestsPerCoreSanityLimit              = 0
+$knownGoodValues                         = @{}
+$applyConfirmedValuesForNotTestedCores   = $false
+$useResumedCoreOrder                     = $false
+$resumedCoreOrder                        = @()
+$resumedIteration                        = 1
+$resumedCoreStates                       = $null
+$autoModeCurrentIteration                = 1
+$autoModeRemainingCoreOrder              = @()
+$autoModeCurrentTestedCore               = $CoreFromAutoMode      # -1 if no core is being tested yet, otherwise the core from the crashed run
+$autoModeResumeAttempts                  = 0                      # The number of resume attempts in a row that couldn't test a single core nor increase a single value
+$maxResumeAttemptsWithoutProgress        = 10                     # If this many resume attempts in a row have made no progress at all, we stop trying to resume
 
 
 # Parameters that are controllable by debug settings
@@ -360,6 +379,9 @@ assignBothVirtualCoresForSingleThread = 0
 
 # The max number of iterations
 # High values are basically unlimited (good for testing over night)
+#
+# Note: This setting is not used in the Automatic Test Mode. There the test runs until every core has found a
+#       good value or has reached the "maxValue" setting
 #
 # Default: 10000
 maxIterations = 10000
@@ -785,10 +807,31 @@ enableAutomaticAdjustment = 0
 startValues = CurrentValues
 
 
+# Curve Optimizer / voltage offset values that you already know to be stable
+# Cores listed here are treated as already finished: they will never be tested, not even after
+# an automatic resume, and their value is included in the results and the final summary
+# The format is <core>:<value>, separated by commas, spaces or the "|" character
+# The enumeration of cores starts with 0
+#
+# You can find a ready to use line at the end of the "_automode-results.txt" file of a previous run
+#
+# Note: This setting takes precedence over "startValues" for the listed cores
+# Note: If a core is also listed in coresToIgnore, the coresToIgnore setting wins
+# Note: This setting only works for Ryzen processors (Curve Optimizer), as the Intel
+#       implementation can currently only set a single voltage offset for all cores
+#
+# Example: knownGoodValues = 3:-25, 7:-18
+# Default: (empty)
+knownGoodValues =
+
+
 # The upper limit for the Curve Optimizer values / voltage offset
 # If this limit has been reached, no further adjustments will be performed
-# Instead the core will now simply throw an error and the regular "skipCoreOnError" setting will be obeyed
 # This is either a Curve Optimizer value or a voltage offset value
+#
+# Note: A core that still throws an error once it has reached this value will not be tested again,
+#       regardless of the "skipCoreOnError" setting. It will be listed as "could not be stabilized"
+#       in the final summary
 #
 # IMPORTANT: Be sensible about this value, setting it too high into the positive could apply a too high
 #            voltage to your CPU and may damage it!
@@ -808,12 +851,27 @@ maxValue = 0
 incrementBy = Default
 
 
+# The number of test runs without an error a core needs to be considered "good"
+# A core counts as finished once it has completed this many test runs in a row without an error at the same
+# Curve Optimizer / voltage offset value. If an error occurs, the value is made less aggressive and the counter
+# starts over for this core
+# Higher values give you more confidence, but the test will take proportionally longer
+#
+# Note: In the Automatic Test Mode, the "maxIterations" setting from the [General] section is not used
+#       The test keeps running until every core has either found a good value or has reached the "maxValue" setting
+#
+# Default: 3
+passesToConfirmCoreValue = 3
+
+
 # Set only the currently tested core to the selected Curve Optimizer / voltage offset value
 # All the other cores will be set to 0, resp. the value from "voltageValueForNotTestedCores",
 # or the determined maximum value if it's higher than any of those
 # This should prevent errors caused by other cores than the currently tested one, or at least diminish the chance for that
 #
 # Note: Currently this only has an effect for Ryzen processors, for Intel up to 14th gen there is only one voltage value
+# Note: Cores for which a good value has already been found are also set to "voltageValueForNotTestedCores",
+#       unless you enable the "applyConfirmedValuesForNotTestedCores" setting below
 #
 # Default: 0
 setVoltageOnlyForTestedCore = 0
@@ -828,6 +886,18 @@ setVoltageOnlyForTestedCore = 0
 #
 # Default: 0
 voltageValueForNotTestedCores = 0
+
+
+# Apply the already found good values to the cores that are not currently being tested
+# This setting only has an effect if "setVoltageOnlyForTestedCore" is enabled
+# By default all cores that are not currently being tested are set to "voltageValueForNotTestedCores", so that a
+# crash can only have been caused by the tested core
+# If you enable this setting, cores that already have a confirmed value will use that value instead. This tests the
+# combination of all of the found values, but if the computer now crashes, it may have been caused by one of those
+# other cores, and the result for the currently tested core may be wrong
+#
+# Default: 0
+applyConfirmedValuesForNotTestedCores = 0
 
 
 # Repeat the test on a core if it has thrown an error and the Curve Optimizer / voltage offset value was increased
@@ -2938,6 +3008,11 @@ function Show-FinalSummary {
 
     $runTimeString = $runtimeArray -Join ', '
 
+    # Store the found Curve Optimizer / voltage offset values permanently, no matter how the script ended
+    Write-AutoModeResultsFooter
+
+    $autoModeSummaryLines = @(Get-AutoModeSummaryLines)
+
     $testedCoresSorted = @($testedCoresArray.GetEnumerator() | Sort-Object -Property Name | ForEach-Object { 'Core ' + $_.Name.ToString() +' (' + $_.Value.ToString() + 'x)' })
     $testedCoresGroups = [System.Collections.ArrayList]::new()
     $groupSize = 5
@@ -3079,6 +3154,16 @@ function Show-FinalSummary {
             else {
                 $returnString += ('No adjustments to the voltage offset were necessary') + [Environment]::NewLine
                 $returnString += ('Voltage offset: ' + $voltageStartingValues[0] + 'mv') + [Environment]::NewLine
+            }
+        }
+
+
+        # Display the Automatic Test Mode results
+        if ($autoModeSummaryLines.Count -gt 0) {
+            $returnString += [Environment]::NewLine
+
+            foreach ($line in $autoModeSummaryLines) {
+                $returnString += ($line) + [Environment]::NewLine
             }
         }
 
@@ -3231,6 +3316,16 @@ function Show-FinalSummary {
     }
 
 
+    # Display the Automatic Test Mode results
+    if ($autoModeSummaryLines.Count -gt 0) {
+        Write-Text('')
+
+        foreach ($line in $autoModeSummaryLines) {
+            Write-ColorText($line) Cyan
+        }
+    }
+
+
     # Display the log file location(s)
     Write-Text('')
     Write-ColorText('────────────────────────────────────────────────────────────────────────────────') Cyan
@@ -3244,6 +3339,10 @@ function Show-FinalSummary {
 
     if ($stressTestLogFileName) {
         Write-ColorText((' - ' + $stressTestPrograms[$settings.General.stressTestProgram]['displayName'] + ':').PadRight($leftStringLength, ' ') + $stressTestLogFileName) Cyan
+    }
+
+    if ($useAutomaticTestMode -and $autoModeResultsFileName) {
+        Write-ColorText((' - Auto Mode:').PadRight($leftStringLength, ' ') + $autoModeResultsFileName) Cyan
     }
 
     Write-Text('')
@@ -4344,18 +4443,22 @@ function Get-InitialUpdateCheckSetting {
 
 <#
 .DESCRIPTION
-    Parse the .automode file
+    Parse one specific .automode file (either the current or the backup generation)
+.PARAMETER filePath
+    [String] The path to the file to parse
 .OUTPUTS
-    [HashTable] The parsed content from the .automode file
+    [HashTable] The parsed content from the provided file
 #>
-function Get-AutoModeFileContent {
-    Write-DebugText('Parsing the .automode file')
+function Get-ParsedAutoModeFile {
+    param(
+        [Parameter(Mandatory=$true)] [String] $filePath
+    )
 
-    if (!(Test-Path -LiteralPath $autoModeFile -PathType Leaf)) {
-        throw('Could not find the .automode file!')
+    if (!(Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        throw('Could not find the file "' + $filePath + '"!')
     }
 
-    $reader = [System.IO.File]::OpenText($autoModeFile)
+    $reader = [System.IO.File]::OpenText($filePath)
     $autoModeFileContentString = $reader.ReadToEnd().Trim()
     $reader.Close()
 
@@ -4369,6 +4472,7 @@ function Get-AutoModeFileContent {
 
 
     # We have some required properties
+    # These are the ones that have existed since the very first version of the file, so we always require them
     @('fileTimestamp', 'lastCoreTested', 'logFileCoreCycler', 'logFileStressTest', 'voltageValues', 'waitBeforeResume') | ForEach-Object {
         if (!($autoModeInfoFromJson -and ($autoModeInfoFromJson | Get-Member $_))) {
             throw('The .automode file is missing the entry "' + $_ + '"!')
@@ -4378,16 +4482,69 @@ function Get-AutoModeFileContent {
 
     # ConvertFrom-Json creates a PSCustomObject, which is hard to iterate, so create a hashtable instead
     $autoModeInfo = @{
-        'fileTimestamp'     = [UInt64] $autoModeInfoFromJson.fileTimestamp
-        'lastCoreTested'    = [Int] $autoModeInfoFromJson.lastCoreTested
-        'logFileCoreCycler' = [String] $autoModeInfoFromJson.logFileCoreCycler
-        'logFileStressTest' = [String] $autoModeInfoFromJson.logFileStressTest
-        'voltageValues'     = [Array] $autoModeInfoFromJson.voltageValues
-        'waitBeforeResume'  = [Int] $autoModeInfoFromJson.waitBeforeResume
+        'fileTimestamp'      = [UInt64] $autoModeInfoFromJson.fileTimestamp
+        'lastCoreTested'     = [Int] $autoModeInfoFromJson.lastCoreTested
+        'logFileCoreCycler'  = [String] $autoModeInfoFromJson.logFileCoreCycler
+        'logFileStressTest'  = [String] $autoModeInfoFromJson.logFileStressTest
+        'voltageValues'      = [Array] $autoModeInfoFromJson.voltageValues
+        'waitBeforeResume'   = [Int] $autoModeInfoFromJson.waitBeforeResume
+        'schemaVersion'      = 1
+        'resultsFile'        = ''
+        'iteration'          = 1
+        'resumeAttempts'     = 0
+        'remainingCoreOrder' = @()
+        'coreStates'         = $null
     }
 
-    if ($autoModeInfo.lastCoreTested -ne $CoreFromAutoMode) {
-        throw('The passed core does not match the core in the .automode file! (' + $autoModeInfo.lastCoreTested + ' vs. ' + $CoreFromAutoMode + ')')
+
+    # The additional entries of the version 2 schema
+    # These are all optional, an old file will simply fall back to the previous behavior
+    if ($autoModeInfoFromJson | Get-Member 'schemaVersion') {
+        $autoModeInfo['schemaVersion'] = [Int] $autoModeInfoFromJson.schemaVersion
+    }
+
+    if ($autoModeInfo['schemaVersion'] -lt 2) {
+        Write-DebugText('The .automode file uses the old schema version ' + $autoModeInfo['schemaVersion'])
+        return $autoModeInfo
+    }
+
+    if ($autoModeInfoFromJson | Get-Member 'resultsFile') {
+        $autoModeInfo['resultsFile'] = [String] $autoModeInfoFromJson.resultsFile
+    }
+
+    if ($autoModeInfoFromJson | Get-Member 'iteration') {
+        $autoModeInfo['iteration'] = [Math]::Max(1, [Int] $autoModeInfoFromJson.iteration)
+    }
+
+    if ($autoModeInfoFromJson | Get-Member 'resumeAttempts') {
+        $autoModeInfo['resumeAttempts'] = [Math]::Max(0, [Int] $autoModeInfoFromJson.resumeAttempts)
+    }
+
+    if ($autoModeInfoFromJson | Get-Member 'remainingCoreOrder') {
+        $autoModeInfo['remainingCoreOrder'] = @(@([Array] $autoModeInfoFromJson.remainingCoreOrder) | ForEach-Object { [Int] $_ })
+    }
+
+    # The JSON keys are strings, we want an integer indexed hashtable
+    if ($autoModeInfoFromJson | Get-Member 'coreStates') {
+        $parsedCoreStates = @{}
+
+        $autoModeInfoFromJson.coreStates.PSObject.Properties | ForEach-Object {
+            $thisCoreNumber = [Int] $_.Name
+            $thisCoreEntry  = $_.Value
+
+            $parsedCoreStates[$thisCoreNumber] = @{
+                'status'    = [String] $thisCoreEntry.status
+                'value'     = [Int] $thisCoreEntry.value
+                'passes'    = [Int] $thisCoreEntry.passes
+                'errors'    = [Int] $thisCoreEntry.errors
+                'tests'     = [Int] $thisCoreEntry.tests
+                'source'    = [String] $thisCoreEntry.source
+                'reason'    = [String] $thisCoreEntry.reason
+                'updatedAt' = [UInt64] $thisCoreEntry.updatedAt
+            }
+        }
+
+        $autoModeInfo['coreStates'] = $parsedCoreStates
     }
 
     return $autoModeInfo
@@ -4397,39 +4554,128 @@ function Get-AutoModeFileContent {
 
 <#
 .DESCRIPTION
+    Parse the .automode file
+    If the current generation of the file is missing or broken, the backup generation is used
+.OUTPUTS
+    [HashTable] The parsed content from the .automode file
+#>
+function Get-AutoModeFileContent {
+    Write-DebugText('Parsing the .automode file')
+
+    # We want to report the problem with the main file, not the one with the backup generation
+    $firstErrorMessage = $null
+
+    foreach ($thisFilePath in @($autoModeFile, $autoModeFileBak)) {
+        try {
+            $autoModeInfo = Get-ParsedAutoModeFile -filePath $thisFilePath
+
+            if ($autoModeInfo['lastCoreTested'] -ne $CoreFromAutoMode) {
+                throw('The passed core does not match the core in the .automode file! (' + $autoModeInfo['lastCoreTested'] + ' vs. ' + $CoreFromAutoMode + ')')
+            }
+
+            if ($thisFilePath -ne $autoModeFile) {
+                Write-DebugText('Using the backup generation of the .automode file')
+            }
+
+            return $autoModeInfo
+        }
+        catch {
+            Write-DebugText('Could not use "' + $thisFilePath + '": ' + $_.ToString())
+
+            if ($null -eq $firstErrorMessage) {
+                $firstErrorMessage = $_.ToString()
+            }
+        }
+    }
+
+    throw($(if ($firstErrorMessage) { $firstErrorMessage } else { 'Could not find the .automode file!' }))
+}
+
+
+
+<#
+.DESCRIPTION
     Set/create the the .automode file
+    This keeps two generations of the file around (.automode and .automode-bak), so that there is always at least
+    one valid file on the disk, even if the computer crashes in the middle of the write process
 .PARAMETER coreNumber
-    [Int] The currently started core
+    [Int] (optional) The core that is now being tested, only provide this before its value is applied to the CPU
+.PARAMETER iterationNumber
+    [Int] (optional) The current iteration
+.PARAMETER remainingCoreOrder
+    [Array] (optional) The cores that still need to be tested in the current iteration, in their test order
 .OUTPUTS
     [Void]
 #>
-function Set-AutoModeFile {
+function Save-AutoModeState {
     param(
-        [Parameter(Mandatory=$true)] [Int] $coreNumber
+        [Parameter(Mandatory=$false)] $coreNumber,
+        [Parameter(Mandatory=$false)] $iterationNumber,
+        [Parameter(Mandatory=$false)] $remainingCoreOrder
     )
+
+    # Only relevant if we want to be able to resume after a crash
+    if (!$useAutomaticTestModeWithResume) {
+        return
+    }
+
+    # The currently tested core, the iteration and the remaining test order are only provided when a new core is being started
+    # All the other calls need to keep the last known values, otherwise we would lose them
+    # Especially the tested core must not be overwritten by a state change of some other core, as the crash after an
+    # unexpected exit is being attributed to it
+    # A core is being started, so the test process is making progress again and the resume attempts start over
+    if ($null -ne $coreNumber) {
+        $Script:autoModeCurrentTestedCore = [Int] $coreNumber
+        $Script:autoModeResumeAttempts    = 0
+    }
+
+    if ($null -ne $iterationNumber) {
+        $Script:autoModeCurrentIteration = [Int] $iterationNumber
+    }
+
+    if ($null -ne $remainingCoreOrder) {
+        $Script:autoModeRemainingCoreOrder = @($remainingCoreOrder)
+    }
+
+    # No core is being tested yet, so there is nothing to resume to
+    # A file with an invalid core number would make the helper script re-start CoreCycler with this invalid core,
+    # which in turn would be treated as a completely new run, discarding all of the stored states
+    if ($autoModeCurrentTestedCore -lt 0) {
+        Write-DebugText('No core is being tested yet, not creating the .automode file')
+        return
+    }
 
     Write-DebugText('Creating the .automode file')
 
     [UInt64] $curTimeStamp = Get-Date -UFormat %s -Millisecond 0
 
 
-    # Remove the old file
-    if (Test-Path -LiteralPath $autoModeFile -PathType Leaf) {
-        $null = Remove-Item -LiteralPath $autoModeFile -Force
+    # The core states, with the core number as the key
+    $coreStatesForFile = @{}
+
+    foreach ($entry in $coreStates.GetEnumerator()) {
+        $coreStatesForFile[$entry.Name.ToString()] = $entry.Value
     }
 
 
     $autoModeFileObject = @{
-        'fileTimestamp'     = $curTimeStamp
-        'lastCoreTested'    = $coreNumber
-        'logFileCoreCycler' = $logFileFullPath
-        'logFileStressTest' = $stressTestLogFilePath
-        'voltageValues'     = $voltageCurrentValues
-        'waitBeforeResume'  = $settings['AutomaticTestMode']['waitBeforeAutomaticResume']
+        'schemaVersion'      = $autoModeSchemaVersion
+        'fileTimestamp'      = $curTimeStamp
+        'lastCoreTested'     = $autoModeCurrentTestedCore
+        'logFileCoreCycler'  = $logFileFullPath
+        'logFileStressTest'  = $stressTestLogFilePath
+        'voltageValues'      = @($voltageCurrentValues)
+        'waitBeforeResume'   = $settings['AutomaticTestMode']['waitBeforeAutomaticResume']
+        'resultsFile'        = $autoModeResultsFileFullPath
+        'iteration'          = $autoModeCurrentIteration
+        'resumeAttempts'     = $autoModeResumeAttempts
+        'remainingCoreOrder' = @($autoModeRemainingCoreOrder)
+        'coreStates'         = $coreStatesForFile
     }
 
     # Convert to JSON
-    $autoModeFileJson = ConvertTo-Json $autoModeFileObject
+    # We need a higher depth than the default of 2 here, otherwise the core states would be mangled
+    $autoModeFileJson = ConvertTo-Json $autoModeFileObject -Depth 5
 
 
     # We save the file under a different name, and then rename it, which will hopefully trigger the file content flush to disk
@@ -4442,14 +4688,33 @@ function Set-AutoModeFile {
     [System.IO.File]::WriteAllLines($autoModeFileTemp, $autoModeFileJson)
 
 
+    # Verify that we can actually parse what we've just written
+    # If we cannot, we keep the previous generation of the file instead of replacing it with a broken one
+    try {
+        $null = ConvertFrom-Json ([System.IO.File]::ReadAllText($autoModeFileTemp).Trim())
+    }
+    catch {
+        Write-VerboseText('Could not verify the newly written .automode-temp file, keeping the previous one!')
+        Write-VerboseText($_)
+        return
+    }
+
+
     # Try to flush the cache to the disk, hopefully reducing the amount of corrupted files
     if ($canUseFlushToDisk) {
         Save-CachedDataToDisk
     }
 
 
+    # Keep the previous generation of the file around, it is only replaced by the next successful save
+    # A hard reset can leave the current file present but not yet flushed to the disk, in which case we can still
+    # fall back to this one
+    if (Test-Path -LiteralPath $autoModeFile -PathType Leaf) {
+        $null = Move-Item -LiteralPath $autoModeFile -Destination $autoModeFileBak -Force
+    }
+
     # Now rename the file
-    $null = Rename-Item -LiteralPath $autoModeFileTemp -NewName $autoModeFile -Force
+    $null = Move-Item -LiteralPath $autoModeFileTemp -Destination $autoModeFile -Force
 
     if (!(Test-Path -LiteralPath $autoModeFile -PathType Leaf)) {
         Exit-WithFatalError -text 'Could not create the .automode file!'
@@ -4460,16 +4725,781 @@ function Set-AutoModeFile {
 
 <#
 .DESCRIPTION
-    Remove the .automode file
+    Set/create the the .automode file
+    Kept for compatibility, this is just a wrapper around Save-AutoModeState
+.PARAMETER coreNumber
+    [Int] The currently started core
+.OUTPUTS
+    [Void]
+#>
+function Set-AutoModeFile {
+    param(
+        [Parameter(Mandatory=$true)] [Int] $coreNumber
+    )
+
+    Save-AutoModeState -coreNumber $coreNumber
+}
+
+
+
+<#
+.DESCRIPTION
+    Remove the .automode file (and its temporary and backup generations)
 .OUTPUTS
     [Void]
 #>
 function Remove-AutoModeFile {
     Write-DebugText('Removing the .automode file')
 
-    if (Test-Path -LiteralPath $autoModeFile -PathType Leaf) {
-        Remove-Item -LiteralPath $autoModeFile
+    foreach ($thisFilePath in @($autoModeFile, $autoModeFileBak, $autoModeFileTemp)) {
+        if (Test-Path -LiteralPath $thisFilePath -PathType Leaf) {
+            Remove-Item -LiteralPath $thisFilePath -Force -ErrorAction Ignore
+        }
     }
+}
+
+
+
+<#
+.DESCRIPTION
+    Check if a core has a final Curve Optimizer / voltage offset value and doesn't need to be tested anymore
+.PARAMETER coreNumber
+    [Int] The core to check
+.OUTPUTS
+    [Bool] True if this core doesn't need to be tested anymore
+#>
+function Test-CoreIsResolved {
+    param(
+        [Parameter(Mandatory=$true)] [Int] $coreNumber
+    )
+
+    if (!$coreStates.ContainsKey($coreNumber)) {
+        return $false
+    }
+
+    return (@('confirmed', 'unstable', 'ignored') -contains $coreStates[$coreNumber]['status'])
+}
+
+
+
+<#
+.DESCRIPTION
+    Get the Curve Optimizer / voltage offset values that the user has provided as already known to be good
+    Also validates the entries
+.OUTPUTS
+    [HashTable] The known good values, with the core number as the key
+#>
+function Get-KnownGoodValuesFromSettings {
+    $foundValues = @{}
+    $entries     = @($settings['AutomaticTestMode']['knownGoodValues'])
+
+    if ($entries.Count -eq 0 -or [String]::IsNullOrWhiteSpace(($entries -Join ''))) {
+        return $foundValues
+    }
+
+
+    # For Intel we can currently only set a single voltage offset for all of the cores, so per-core values make no sense
+    if ($isIntelProcessor) {
+        Exit-WithFatalError -text ('The "knownGoodValues" setting is not supported on an Intel processor!' + [Environment]::NewLine + 'There currently is only a single voltage offset for all of the cores.')
+    }
+
+
+    $minCoValue = $(if ($processor.Name -Match '[7-9]\d{3}') { -50 } else { -30 } )
+    $maxValue   = [Int] $settings['AutomaticTestMode']['maxValue']
+
+    foreach ($entry in $entries) {
+        $thisEntry = ([String] $entry).Trim(' ', '"', '''', [Char]0x09)
+
+        if ($thisEntry.Length -eq 0) {
+            continue
+        }
+
+        # Reset the matches, otherwise we may get a stale match here (see #157)
+        $Matches = $null
+
+        if ($thisEntry -notmatch '^(?<core>\d+)\s*:\s*(?<value>[+-]?\d+)$') {
+            $msg  = 'Invalid "knownGoodValues" entry detected: "' + $thisEntry + '"'
+            $msg += [Environment]::NewLine + 'The expected format is <core>:<value>, e.g. knownGoodValues = 3:-25, 7:-18'
+
+            Exit-WithFatalError -text $msg
+        }
+
+        $thisCore  = [Int] $Matches['core']
+        $thisValue = [Int] $Matches['value']
+
+        if ($foundValues.ContainsKey($thisCore)) {
+            Exit-WithFatalError -text ('Core ' + $thisCore + ' is listed more than once in the "knownGoodValues" setting!')
+        }
+
+        if ($thisCore -gt ($numPhysCores-1)) {
+            Exit-WithFatalError -text ('The "knownGoodValues" entry for core ' + $thisCore + ' is invalid, this CPU only has ' + $numPhysCores + ' physical cores (max is ' + ($numPhysCores-1) + ')!')
+        }
+
+        if ([Math]::Abs($thisValue) -gt $limitForCoValues) {
+            Exit-WithFatalError -text ('Found an invalid value in the "knownGoodValues" setting (either higher or lower than +-' + $limitForCoValues + '): ' + $thisEntry)
+        }
+
+        if ($thisValue -lt $minCoValue) {
+            Write-ColorText('Notice: The "knownGoodValues" entry for core ' + $thisCore + ' (' + $thisValue + ') is below the minimum value of this processor (' + $minCoValue + ')') Yellow
+        }
+
+        if ($thisValue -gt $maxValue) {
+            Write-ColorText('Notice: The "knownGoodValues" entry for core ' + $thisCore + ' (' + $thisValue + ') is above the "maxValue" setting (' + $maxValue + '), using it anyway') Yellow
+        }
+
+        if ($settings.General.coresToIgnore -contains $thisCore) {
+            Write-ColorText('Notice: Core ' + $thisCore + ' is listed in "knownGoodValues", but also in "coresToIgnore"') Yellow
+            Write-ColorText('        The "coresToIgnore" setting takes precedence, this core will not be touched at all') Yellow
+            continue
+        }
+
+        $foundValues[$thisCore] = $thisValue
+    }
+
+    return $foundValues
+}
+
+
+
+<#
+.DESCRIPTION
+    Build the state entries for all of the cores for the Automatic Test Mode
+    This is the authoritative source for which core still needs to be tested
+.OUTPUTS
+    [Void] Sets $Script:coreStates
+#>
+function Initialize-CoreStates {
+    Write-DebugText('Initializing the core states')
+
+    [UInt64] $curTimeStamp = Get-Date -UFormat %s -Millisecond 0
+
+    $newCoreStates = @{}
+
+    for ($coreNumber = 0; $coreNumber -lt $numPhysCores; $coreNumber++) {
+        $newCoreStates[$coreNumber] = @{
+            'status'    = 'pending'
+            'value'     = [Int] $voltageCurrentValues[$coreNumber]
+            'passes'    = 0
+            'errors'    = 0
+            'tests'     = 0
+            'source'    = 'test'
+            'reason'    = ''
+            'updatedAt' = $curTimeStamp
+        }
+    }
+
+
+    # Restore the states from the previous run if we're resuming after a crash
+    if ($resumedCoreStates) {
+        Write-VerboseText('Restoring the core states from the previous run')
+
+        foreach ($entry in $resumedCoreStates.GetEnumerator()) {
+            $thisCoreNumber = [Int] $entry.Name
+
+            if ($thisCoreNumber -lt 0 -or $thisCoreNumber -gt ($numPhysCores-1)) {
+                continue
+            }
+
+            $newCoreStates[$thisCoreNumber] = $entry.Value
+        }
+    }
+
+
+    # Cores that are being ignored are never tested
+    foreach ($ignoredCore in @($settings.General.coresToIgnore)) {
+        $thisCoreNumber = [Int] $ignoredCore
+
+        if ($thisCoreNumber -lt 0 -or $thisCoreNumber -gt ($numPhysCores-1)) {
+            continue
+        }
+
+        $newCoreStates[$thisCoreNumber]['status']    = 'ignored'
+        $newCoreStates[$thisCoreNumber]['reason']    = ''
+        $newCoreStates[$thisCoreNumber]['updatedAt'] = $curTimeStamp
+    }
+
+
+    # The values that the user has provided as already known to be good
+    # These use the very same mechanism as a value that we have found ourselves, they're just flagged differently
+    $newCoresFromConfig = @()
+
+    foreach ($entry in $knownGoodValues.GetEnumerator()) {
+        $thisCoreNumber = [Int] $entry.Name
+        $thisValue      = [Int] $entry.Value
+
+        if ($newCoreStates[$thisCoreNumber]['status'] -eq 'ignored') {
+            continue
+        }
+
+        # Only announce a value that we didn't already know about from a previous run
+        $isNewEntry = !($newCoreStates[$thisCoreNumber]['status'] -eq 'confirmed' -and $newCoreStates[$thisCoreNumber]['source'] -eq 'config')
+
+        $newCoreStates[$thisCoreNumber]['status']    = $(if ($isNewEntry) { 'pending' } else { 'confirmed' })
+        $newCoreStates[$thisCoreNumber]['value']     = $thisValue
+        $newCoreStates[$thisCoreNumber]['passes']    = $passesToConfirmCoreValue
+        $newCoreStates[$thisCoreNumber]['source']    = 'config'
+        $newCoreStates[$thisCoreNumber]['reason']    = ''
+        $newCoreStates[$thisCoreNumber]['updatedAt'] = $curTimeStamp
+
+        $Script:voltageStartingValues[$thisCoreNumber] = $thisValue
+        $Script:voltageCurrentValues[$thisCoreNumber]  = $thisValue
+
+        if ($isNewEntry) {
+            $newCoresFromConfig += $thisCoreNumber
+        }
+
+        Write-VerboseText('Core ' + $thisCoreNumber + ' has a known good value of ' + $thisValue + ' from the config file, it will not be tested')
+    }
+
+
+    $Script:coreStates = $newCoreStates
+
+
+    # Store the values from the config file in the results file as well, so that the file is complete
+    foreach ($thisCoreNumber in $newCoresFromConfig) {
+        Set-CoreState -coreNumber $thisCoreNumber -status 'confirmed' -value $knownGoodValues[$thisCoreNumber]
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Create the Automatic Test Mode results file, which permanently stores the found values
+    If we're resuming after a crash, the file of the previous run is re-used
+.OUTPUTS
+    [Void]
+#>
+function Initialize-AutoModeResultsFile {
+    # We may already have gotten the path from the .automode file when resuming
+    if ([String]::IsNullOrWhiteSpace($autoModeResultsFileFullPath)) {
+        $Script:autoModeResultsFileName     = ($logFileName -Replace '\.log$', '') + '_automode-results.txt'
+        $Script:autoModeResultsFileFullPath = $logFilePathAbsolute + $autoModeResultsFileName
+    }
+    else {
+        $Script:autoModeResultsFileName = Split-Path -LiteralPath $autoModeResultsFileFullPath -Leaf
+    }
+
+    Write-DebugText('The Automatic Test Mode results file: ' + $autoModeResultsFileFullPath)
+
+    # The file already exists, we're appending to it
+    if (Test-Path -LiteralPath $autoModeResultsFileFullPath -PathType Leaf) {
+        Write-AutoModeResultEntry -text '' -NoLogEntry
+        Write-AutoModeResultEntry -text ('Resumed:   ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) -NoLogEntry
+        return
+    }
+
+
+    $autoModeDescription = $(if ($isIntelProcessor) { 'voltage offset' } else { 'Curve Optimizer' })
+    $settingsString      = 'startValues = ' + ($settings['AutomaticTestMode']['startValues'] -Join ' ')
+    $settingsString     += ' | maxValue = ' + $settings['AutomaticTestMode']['maxValue']
+    $settingsString     += ' | incrementBy = ' + $settings['AutomaticTestMode']['incrementBy']
+    $settingsString     += ' | passesToConfirmCoreValue = ' + $passesToConfirmCoreValue
+
+    Write-AutoModeResultEntry -text ('CoreCycler Automatic Test Mode - ' + $autoModeDescription + ' results') -NoLogEntry
+    Write-AutoModeResultEntry -text ('Started:   ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) -NoLogEntry
+    Write-AutoModeResultEntry -text ('Version:   ' + $version) -NoLogEntry
+    Write-AutoModeResultEntry -text ('Processor: ' + $processor.Name + ' (' + $numPhysCores + ' physical cores)') -NoLogEntry
+    Write-AutoModeResultEntry -text ('Settings:  ' + $settingsString) -NoLogEntry
+    Write-AutoModeResultEntry -text ('────────────────────────────────────────────────────────────────────────────────') -NoLogEntry
+}
+
+
+
+<#
+.DESCRIPTION
+    Append a line to the Automatic Test Mode results file
+    The file is append-only, so a crash can at worst cut off the very last line
+.PARAMETER text
+    [String] The line to append
+.PARAMETER NoLogEntry
+    [Switch] (optional) If set, the line will not additionally be written to the regular log file
+.OUTPUTS
+    [Void]
+#>
+function Write-AutoModeResultEntry {
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()] [String] $text,
+        [Parameter(Mandatory=$false)] [Switch] $NoLogEntry
+    )
+
+    if ([String]::IsNullOrWhiteSpace($autoModeResultsFileFullPath)) {
+        return
+    }
+
+    for ($numTry = 1; $numTry -le 3; $numTry++ ) {
+        try {
+            # The second parameter defines if to append ($true) or overwrite ($false)
+            $stream = [System.IO.StreamWriter]::new($autoModeResultsFileFullPath, $true, ([System.Text.Utf8Encoding]::new()))
+            $stream.WriteLine($text)
+            $stream.Close()
+
+            break
+        }
+        catch {
+            Write-DebugText('Couldn''t write the Automatic Test Mode results file on try ' + $numTry)
+            Start-Sleep -Milliseconds 250
+        }
+    }
+
+    if (-not $NoLogEntry.IsPresent) {
+        Write-LogEntry($text)
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Try to re-build the resolved core states from an existing results file
+    This is the last resort if the .automode file cannot be used anymore
+.PARAMETER filePath
+    [String] The path to the results file
+.OUTPUTS
+    [HashTable] The core states that could be recovered, with the core number as the key
+#>
+function Read-AutoModeResultsFile {
+    param(
+        [Parameter(Mandatory=$true)] [String] $filePath
+    )
+
+    $recoveredStates = @{}
+
+    if ([String]::IsNullOrWhiteSpace($filePath) -or !(Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        return $recoveredStates
+    }
+
+    Write-VerboseText('Trying to recover the already found values from the results file')
+
+    [UInt64] $curTimeStamp = Get-Date -UFormat %s -Millisecond 0
+
+    foreach ($line in @([System.IO.File]::ReadAllLines($filePath))) {
+        # Reset the matches, otherwise we may get a stale match here (see #157)
+        $Matches = $null
+
+        if ($line -notmatch '^\S+ \S+\s+Core\s+(\d+)\s+(KNOWN|CONFIRMED|UNSTABLE)\s+\S+\s+(-?\d+)') {
+            continue
+        }
+
+        $thisCoreNumber = [Int] $Matches[1]
+        $thisEventType  = [String] $Matches[2]
+        $thisValue      = [Int] $Matches[3]
+
+        $recoveredStates[$thisCoreNumber] = @{
+            'status'    = $(if ($thisEventType -eq 'UNSTABLE') { 'unstable' } else { 'confirmed' })
+            'value'     = $thisValue
+            'passes'    = $passesToConfirmCoreValue
+            'errors'    = 0
+            'tests'     = 0
+            'source'    = $(if ($thisEventType -eq 'KNOWN') { 'config' } else { 'test' })
+            'reason'    = $(if ($thisEventType -eq 'UNSTABLE') { 'maxValue' } else { '' })
+            'updatedAt' = $curTimeStamp
+        }
+    }
+
+    return $recoveredStates
+}
+
+
+
+<#
+.DESCRIPTION
+    Build the "knownGoodValues" string for all of the cores that have a confirmed value
+.PARAMETER providedCoreStates
+    [HashTable] (optional) The core states to use, defaults to the current ones
+.PARAMETER OnlyFromConfig
+    [Switch] (optional) If set, will only include the values that the user has provided in the config file
+.OUTPUTS
+    [String] The string for the config file, or an empty string if there are no confirmed values
+#>
+function Get-ConfirmedValuesString {
+    param(
+        [Parameter(Mandatory=$false)] $providedCoreStates,
+        [Parameter(Mandatory=$false)] [Switch] $OnlyFromConfig
+    )
+
+    $statesToUse = $(if ($providedCoreStates) { $providedCoreStates } else { $coreStates })
+    $entries     = @()
+
+    foreach ($entry in @($statesToUse.GetEnumerator() | Sort-Object -Property { [Int] $_.Name })) {
+        if ($entry.Value['status'] -ne 'confirmed') {
+            continue
+        }
+
+        if ($OnlyFromConfig.IsPresent -and $entry.Value['source'] -ne 'config') {
+            continue
+        }
+
+        $entries += ([Int] $entry.Name).ToString() + ':' + ([Int] $entry.Value['value']).ToString()
+    }
+
+    if ($entries.Count -eq 0) {
+        return ''
+    }
+
+    return ($entries -Join ', ')
+}
+
+
+
+<#
+.DESCRIPTION
+    If a leftover .automode file from a previous, crashed run contains already confirmed values, display them
+    before the file is being discarded, so that they're not silently lost
+.OUTPUTS
+    [Void]
+#>
+function Show-DiscardedAutoModeResults {
+    if (!(Test-Path -LiteralPath $autoModeFile -PathType Leaf) -and !(Test-Path -LiteralPath $autoModeFileBak -PathType Leaf)) {
+        return
+    }
+
+    foreach ($thisFilePath in @($autoModeFile, $autoModeFileBak)) {
+        try {
+            $previousInfo = Get-ParsedAutoModeFile -filePath $thisFilePath
+        }
+        catch {
+            continue
+        }
+
+        if (!$previousInfo['coreStates']) {
+            continue
+        }
+
+        $previousValuesString = Get-ConfirmedValuesString -providedCoreStates $previousInfo['coreStates']
+
+        if ([String]::IsNullOrWhiteSpace($previousValuesString)) {
+            return
+        }
+
+        Write-Text('')
+        Write-ColorText('There is a leftover state file from a previous Automatic Test Mode run.') Yellow
+        Write-ColorText('It already contained values for the following cores:') Yellow
+        Write-ColorText('knownGoodValues = ' + $previousValuesString) Cyan
+        Write-ColorText('You can add this line to the [AutomaticTestMode] section of your config file if you') Yellow
+        Write-ColorText('do not want these cores to be tested again.') Yellow
+        Write-Text('')
+
+        return
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Set the state of a core and store it permanently
+    This is the only place where the status of a core is being changed
+.PARAMETER coreNumber
+    [Int] The core to change
+.PARAMETER status
+    [String] The new status (pending, testing, confirmed, unstable, ignored)
+.PARAMETER value
+    [Int] (optional) The Curve Optimizer / voltage offset value for this core
+.PARAMETER reason
+    [String] (optional) Why a core is now "unstable" (maxValue or sanityLimit)
+.OUTPUTS
+    [Void]
+#>
+function Set-CoreState {
+    param(
+        [Parameter(Mandatory=$true)] [Int] $coreNumber,
+        [Parameter(Mandatory=$true)] [String] $status,
+        [Parameter(Mandatory=$false)] $value,
+        [Parameter(Mandatory=$false)] [String] $reason = ''
+    )
+
+    if (!$coreStates.ContainsKey($coreNumber)) {
+        return
+    }
+
+    [UInt64] $curTimeStamp = Get-Date -UFormat %s -Millisecond 0
+
+    $thisCoreState              = $coreStates[$coreNumber]
+    $previousStatus             = $thisCoreState['status']
+    $thisCoreState['status']    = $status
+    $thisCoreState['reason']    = $reason
+    $thisCoreState['updatedAt'] = $curTimeStamp
+
+    if ($null -ne $value) {
+        $thisCoreState['value'] = [Int] $value
+    }
+
+
+    # Store the found values also in the "legacy" arrays, which are being used for the various summaries
+    if ($status -eq 'unstable') {
+        if ($coresWithErrorAndMaxVoltageValue -notcontains $coreNumber) {
+            [Void] $Script:coresWithErrorAndMaxVoltageValue.Add($coreNumber)
+        }
+    }
+
+
+    # Store the new state before the permanent entry is appended to the results file
+    # The two files cannot be written at the very same moment, and the results file is the more durable one (it is
+    # append-only), so it has to be the last step: a final value in the results file that the resumable state doesn't
+    # know about yet is recovered on the next start, while the other way around the core would be tested again
+    # No -coreNumber here, a state change must not change the core that is currently being tested
+    Save-AutoModeState
+
+
+    # Write the permanent entry for a final value
+    if ($previousStatus -ne $status -and @('confirmed', 'unstable') -contains $status) {
+        $autoModeDescription = $(if ($useCurveOptimizer) { 'Curve Optimizer' } else { 'voltage offset' })
+        $valueLabel          = $(if ($useCurveOptimizer) { 'CO' } else { 'mV' })
+        $thisValue           = [Int] $thisCoreState['value']
+        $timestamp           = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $eventType           = ''
+        $noteString          = ''
+
+        if ($status -eq 'confirmed') {
+            $eventType = $(if ($thisCoreState['source'] -eq 'config') { 'KNOWN' } else { 'CONFIRMED' })
+
+            if ($thisCoreState['source'] -eq 'config') {
+                $noteString = 'provided in the config file'
+
+                if ($canUseWindowsEventLog) {
+                    Write-AppEventLog -type 'core_co_known' -infoString1 $coreNumber -infoString2 $thisValue
+                }
+            }
+            else {
+                $noteString = $thisCoreState['passes'].ToString() + '/' + $passesToConfirmCoreValue + ' passes, ' + $thisCoreState['errors'] + ' errors'
+
+                if ($canUseWindowsEventLog) {
+                    Write-AppEventLog -type 'core_co_confirmed' -infoString1 $coreNumber -infoString2 $thisValue -infoString3 $noteString
+                }
+
+                Write-Text('')
+                Write-ColorText('Core ' + $coreNumber + ' has completed ' + $passesToConfirmCoreValue + ' test runs without an error, the ' + $autoModeDescription + ' value of ' + $thisValue + ' is confirmed') Green
+                Write-Text('')
+            }
+        }
+        else {
+            $eventType  = 'UNSTABLE'
+            $noteString = $(if ($reason -eq 'maxValue') { 'maximum value reached and still erroring' } else { 'internal safety limit reached' })
+
+            if ($canUseWindowsEventLog) {
+                Write-AppEventLog -type 'core_co_unstable' -infoString1 $coreNumber -infoString2 $thisValue -infoString3 $noteString
+            }
+
+            Write-Text('')
+            Write-ColorText('No stable ' + $autoModeDescription + ' value could be found for core ' + $coreNumber + ' (' + $noteString + ')') Red
+            Write-ColorText('This core will not be tested again') Red
+            Write-Text('')
+        }
+
+        $resultLine  = $timestamp + '  Core ' + $coreNumber.ToString().PadLeft(3, ' ') + '  ' + $eventType.PadRight(9, ' ')
+        $resultLine += '  ' + $valueLabel + ' ' + $thisValue.ToString().PadLeft(5, ' ')
+        $resultLine += '   (' + $noteString + ')'
+
+        Write-AutoModeResultEntry -text $resultLine -NoLogEntry
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Register a test run that has completed without an error for a core
+    If enough consecutive passes have been collected, the value for this core is considered confirmed
+.PARAMETER coreNumber
+    [Int] The core that has completed a test run
+.OUTPUTS
+    [Void]
+#>
+function Add-CorePass {
+    param(
+        [Parameter(Mandatory=$true)] [Int] $coreNumber
+    )
+
+    if (!$useAutomaticTestMode -or !$coreStates.ContainsKey($coreNumber)) {
+        return
+    }
+
+    # A core that already has a final value doesn't collect any more passes
+    if (Test-CoreIsResolved $coreNumber) {
+        return
+    }
+
+    $thisCoreState = $coreStates[$coreNumber]
+    $thisCoreState['passes']++
+
+    $autoModeDescription = $(if ($useCurveOptimizer) { 'Curve Optimizer' } else { 'voltage offset' })
+    $thisValue           = $(if ($useCurveOptimizer) { [Int] $voltageCurrentValues[$coreNumber] } else { [Int] $voltageCurrentValues[0] })
+
+    if ($thisCoreState['passes'] -ge $passesToConfirmCoreValue) {
+        Set-CoreState -coreNumber $coreNumber -status 'confirmed' -value $thisValue
+        return
+    }
+
+    Write-ColorText('           Core ' + $coreNumber + ': ' + $thisCoreState['passes'] + '/' + $passesToConfirmCoreValue + ' confirmation passes at a ' + $autoModeDescription + ' value of ' + $thisValue) Cyan
+
+    # No -coreNumber here, a completed pass must not change the core that is currently being tested
+    Save-AutoModeState
+}
+
+
+
+<#
+.DESCRIPTION
+    Reset the number of collected error free test runs for a core, e.g. because it has thrown an error
+.PARAMETER coreNumber
+    [Int] The core to reset
+.PARAMETER CountError
+    [Switch] (optional) If set, will also increase the error counter for this core
+.OUTPUTS
+    [Void]
+#>
+function Reset-CorePasses {
+    param(
+        [Parameter(Mandatory=$true)] [Int] $coreNumber,
+        [Parameter(Mandatory=$false)] [Switch] $CountError
+    )
+
+    if (!$coreStates.ContainsKey($coreNumber)) {
+        return
+    }
+
+    $coreStates[$coreNumber]['passes'] = 0
+
+    if ($CountError.IsPresent) {
+        $coreStates[$coreNumber]['errors']++
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Build the Automatic Test Mode part of the final summary
+    Used for both the displayed and the returned version of the summary, as well as for the results file
+.OUTPUTS
+    [Array] The lines for the summary
+#>
+function Get-AutoModeSummaryLines {
+    $lines = @()
+
+    if (!$useAutomaticTestMode -or $coreStates.Count -lt 1) {
+        return $lines
+    }
+
+    $autoModeDescription = $(if ($useCurveOptimizer) { 'Curve Optimizer' } else { 'voltage offset' })
+    $numConfirmedCores   = 0
+    $numUnstableCores    = 0
+    $unstableCores       = @()
+    $unresolvedCores     = @()
+    $statusEntries       = @()
+
+    for ($coreNumber = 0; $coreNumber -lt $numPhysCores; $coreNumber++) {
+        $thisStatus = $(if ($coreStates.ContainsKey($coreNumber)) { $coreStates[$coreNumber]['status'] } else { 'pending' })
+        $thisSource = $(if ($coreStates.ContainsKey($coreNumber)) { $coreStates[$coreNumber]['source'] } else { 'test' })
+        $thisReason = $(if ($coreStates.ContainsKey($coreNumber)) { $coreStates[$coreNumber]['reason'] } else { '' })
+        $thisLabel  = '--'
+
+        if ($thisStatus -eq 'confirmed') {
+            $thisLabel = $(if ($thisSource -eq 'config') { 'CFG' } else { 'OK' })
+            $numConfirmedCores++
+        }
+        elseif ($thisStatus -eq 'unstable') {
+            $thisLabel = $(if ($thisReason -eq 'sanityLimit') { 'LIM' } else { 'MAX' })
+            $numUnstableCores++
+            $unstableCores += $coreNumber.ToString()
+        }
+        elseif ($thisStatus -eq 'ignored') {
+            $thisLabel = 'IGN'
+        }
+        else {
+            $unresolvedCores += $coreNumber.ToString()
+        }
+
+        $statusEntries += $thisLabel.PadLeft(4, ' ')
+    }
+
+
+    if ($useCurveOptimizer) {
+        # This block gets its own header row, so that the labels always line up with their core,
+        # no matter which of the tables above it is being displayed with
+        $coCoresString = ((0..($numPhysCores-1)) | ForEach-Object { ('C' + $_.ToString()).PadLeft(4, ' ') }) -Join ' |'
+
+        $lines += ('Core            ' + $coCoresString)
+        $lines += ('Status          ' + ($statusEntries -Join ' |'))
+        $lines += ''
+        $lines += 'Legend: OK  = confirmed by this run'
+        $lines += '        CFG = provided via knownGoodValues'
+        $lines += '        MAX = could not be stabilized, the maximum value was reached'
+        $lines += '        LIM = stopped by the internal safety limit'
+        $lines += '        IGN = ignored core'
+        $lines += '        --  = no final value (the run did not finish)'
+        $lines += ''
+    }
+
+    $lines += ('Confirmed ' + $autoModeDescription + ' values for ' + $numConfirmedCores + ' of ' + $numPhysCores + ' cores')
+
+    if ($numUnstableCores -gt 0) {
+        $lines += ($numUnstableCores.ToString() + ' core' + $(if ($numUnstableCores -gt 1) { 's' }) + ' could not be stabilized: ' + ($unstableCores -Join ', '))
+    }
+
+    $lines += ('Cores without a final value: ' + $(if ($unresolvedCores.Count -gt 0) { $unresolvedCores -Join ', ' } else { '(none)' }))
+
+
+    $confirmedValuesString = Get-ConfirmedValuesString
+
+    if (![String]::IsNullOrWhiteSpace($confirmedValuesString) -and $useCurveOptimizer) {
+        $lines += ''
+        $lines += 'Copy this into your config file to keep the results:'
+        $lines += '[AutomaticTestMode]'
+        $lines += ('knownGoodValues = ' + $confirmedValuesString)
+    }
+
+    $lines += ''
+    $lines += 'Note: CoreCycler does not store these values permanently. Set them in your BIOS'
+    $lines += '      (or with a tool such as PBO2 Tuner) to keep them after a reboot.'
+
+    if (![String]::IsNullOrWhiteSpace($autoModeResultsFileFullPath)) {
+        $lines += ''
+        $lines += 'The Automatic Test Mode results have been written to:'
+        $lines += $autoModeResultsFileFullPath
+    }
+
+    return $lines
+}
+
+
+
+<#
+.DESCRIPTION
+    Append the final block with all of the found values to the Automatic Test Mode results file
+    This runs on every exit path, so that even after CTRL+C or a fatal error there's a usable result
+    It is deliberately kept short, as this file is being appended to by every (resumed) run
+.OUTPUTS
+    [Void]
+#>
+function Write-AutoModeResultsFooter {
+    if (!$useAutomaticTestMode -or $autoModeResultsFooterWritten -or [String]::IsNullOrWhiteSpace($autoModeResultsFileFullPath)) {
+        return
+    }
+
+    $Script:autoModeResultsFooterWritten = $true
+
+    $autoModeDescription = $(if ($useCurveOptimizer) { 'Curve Optimizer' } else { 'voltage offset' })
+    $numConfirmedCores   = @(@($coreStates.GetEnumerator()) | Where-Object { $_.Value['status'] -eq 'confirmed' }).Count
+    $numUnstableCores    = @(@($coreStates.GetEnumerator()) | Where-Object { $_.Value['status'] -eq 'unstable' }).Count
+
+    $finishedLine  = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  RUN ENDED - ' + $numConfirmedCores + ' of ' + $numPhysCores + ' cores confirmed'
+    $finishedLine += $(if ($numUnstableCores -gt 0) { ', ' + $numUnstableCores + ' could not be stabilized' })
+
+    Write-AutoModeResultEntry -text ('────────────────────────────────────────────────────────────────────────────────') -NoLogEntry
+    Write-AutoModeResultEntry -text $finishedLine -NoLogEntry
+
+    # Only the ready to use line for the config file, the whole summary is displayed on the screen and in the log file
+    $confirmedValuesString = Get-ConfirmedValuesString
+
+    if (![String]::IsNullOrWhiteSpace($confirmedValuesString) -and $useCurveOptimizer) {
+        Write-AutoModeResultEntry -text '' -NoLogEntry
+        Write-AutoModeResultEntry -text ('The found ' + $autoModeDescription + ' values:') -NoLogEntry
+        Write-AutoModeResultEntry -text ('knownGoodValues = ' + $confirmedValuesString) -NoLogEntry
+    }
+
+    Write-AutoModeResultEntry -text '' -NoLogEntry
 }
 
 
@@ -4659,6 +5689,7 @@ function Import-Settings {
     $settingsWithArrayOrString = @(
         #'coreTestOrder' # This is handled later
         'startValues'
+        'knownGoodValues'
     )
 
     # Check if the file exists
@@ -5402,6 +6433,35 @@ function Initialize-AutomaticTestMode {
             Write-DebugText('The Automatic Test Mode starting values from the .automode file:')
             Write-DebugText('We will increase this value because of the crash')
             Write-DebugText($voltageStartValuesArray)
+
+
+            # Continue where we left off before the crash (see #106)
+            # The older schema version doesn't have these entries, in which case we start the test order from the beginning again
+            if ($autoModeInfo['schemaVersion'] -ge 2) {
+                $Script:resumedCoreStates           = $autoModeInfo['coreStates']
+                $Script:resumedIteration            = [Int] $autoModeInfo['iteration']
+                $Script:resumedCoreOrder            = @($autoModeInfo['remainingCoreOrder'])
+                $Script:useResumedCoreOrder         = $true
+                $Script:autoModeResultsFileFullPath = [String] $autoModeInfo['resultsFile']
+
+                # Keep the restored values, so that a crash before the first core has been started doesn't lose them
+                $Script:autoModeCurrentIteration   = $Script:resumedIteration
+                $Script:autoModeRemainingCoreOrder = @($Script:resumedCoreOrder)
+
+                Write-DebugText('The iteration before the crash:            ' + $resumedIteration)
+                Write-DebugText('The remaining test order before the crash: ' + ($resumedCoreOrder -Join ', '))
+            }
+            else {
+                Write-VerboseText('The .automode file is from an older version, the test order will start from the beginning')
+            }
+
+
+            # Count this resume attempt
+            # The counter is set back to 0 as soon as a core is started or a value has actually been increased, so it
+            # only keeps rising if a resume cannot make any progress at all (see the check further down)
+            $Script:autoModeResumeAttempts = [Int] $autoModeInfo['resumeAttempts'] + 1
+
+            Write-DebugText('The number of resume attempts without any progress: ' + $autoModeResumeAttempts)
         }
     }
 
@@ -5418,6 +6478,11 @@ function Initialize-AutomaticTestMode {
         # For Intel, this has most likely only one entry, but can also contain one entry for each core (which should all be the same value though)
         # We do not yet have the ability to set the voltage on a per-core basis for Intel
         $voltageStartValuesArray = @($voltageStartValuesString -Split '\s+')
+
+
+        # There may be a leftover state file from a previous, crashed run
+        # We're going to discard it, but we don't want to silently throw away the values that were already found
+        Show-DiscardedAutoModeResults
 
 
         # At this point, we also want to ask for the creation of a System Restore Point
@@ -5492,6 +6557,64 @@ function Initialize-AutomaticTestMode {
     $Script:voltageValueForNotTestedCores  = $settings.AutomaticTestMode.voltageValueForNotTestedCores
 
 
+    # How many test runs in a row without an error a core needs to be considered "good"
+    $Script:passesToConfirmCoreValue              = [Math]::Max(1, [Int] $settings.AutomaticTestMode.passesToConfirmCoreValue)
+    $Script:applyConfirmedValuesForNotTestedCores = ($settings.AutomaticTestMode.applyConfirmedValuesForNotTestedCores -gt 0)
+
+
+    # The values that the user has already found to be good, these cores will not be tested at all
+    $Script:knownGoodValues = Get-KnownGoodValuesFromSettings
+
+
+    # An internal safety limit for the number of test runs for a single core
+    # This should never be reached, it only exists so that a core cannot be tested indefinitely if something goes wrong
+    $incrementByValue = [Math]::Max(1, [Int] $settings.AutomaticTestMode.incrementBy)
+    $maxValueSetting  = [Int] $settings.AutomaticTestMode.maxValue
+    $largestDistance  = 0
+
+    $voltageStartValuesArray | ForEach-Object {
+        $largestDistance = [Math]::Max($largestDistance, [Math]::Abs([Int] $_ - $maxValueSetting))
+    }
+
+    $Script:maxTestsPerCoreSanityLimit = (([Math]::Ceiling($largestDistance / $incrementByValue) + 2) * $passesToConfirmCoreValue) + 10
+
+    Write-DebugText('The internal safety limit for the number of tests per core: ' + $maxTestsPerCoreSanityLimit)
+
+
+    # The permanent results file, which stores the found values even if the .automode file is gone
+    Initialize-AutoModeResultsFile
+
+    # The results file belongs to this very run (its path travels in the .automode file), and it is written after the
+    # state has been stored, so it can hold a final value that the restored state doesn't know about yet
+    # If the .automode file didn't have the core states at all (e.g. because it was written by an older version),
+    # the results file is the only source for the already found values
+    # Without this a torn state save would make the script test an already confirmed core again (M1)
+    if ($CoreFromAutoMode -gt -1 -and ![String]::IsNullOrWhiteSpace($autoModeResultsFileFullPath)) {
+        $recoveredCoreStates = Read-AutoModeResultsFile -filePath $autoModeResultsFileFullPath
+
+        if (!$resumedCoreStates) {
+            $Script:resumedCoreStates = $recoveredCoreStates
+        }
+        else {
+            foreach ($entry in $recoveredCoreStates.GetEnumerator()) {
+                $thisCoreNumber = [Int] $entry.Name
+
+                # The restored state already has a final value for this core, and it holds more details (passes, errors, tests)
+                if ($resumedCoreStates.ContainsKey($thisCoreNumber) -and @('confirmed', 'unstable', 'ignored') -contains $resumedCoreStates[$thisCoreNumber]['status']) {
+                    continue
+                }
+
+                Write-VerboseText('Core ' + $thisCoreNumber + ' already has a final value in the results file, restoring it from there')
+
+                $Script:resumedCoreStates[$thisCoreNumber] = $entry.Value
+            }
+        }
+    }
+
+    # The state of each core, this decides which core still needs to be tested
+    Initialize-CoreStates
+
+
     if ($useAutomaticTestModeWithResume) {
         Write-VerboseText('Automatic Test Mode with resuming after unexpected exit enabled')
 
@@ -5504,6 +6627,70 @@ function Initialize-AutomaticTestMode {
         # But not the automatic resume, so remove the scheduled task and file
         Remove-AutoModeScheduledTask
         Remove-AutoModeFile
+    }
+
+
+    # Adjust the value of the previously tested core from before the reboot if we're in Automatic Test Mode with resume
+    # This has to happen before any value is applied to the processor, otherwise we would set the very same value that
+    # has caused the crash again, which can crash the machine once more before the increased value has been stored,
+    # repeating this forever (especially with setVoltageOnlyForTestedCore = 0, where all of the cores get their values here)
+    # The core itself is put back to the front of the test order via the persisted remaining test order (see #106)
+    if ($useAutomaticTestModeWithResume -and $CoreFromAutoMode -gt -1) {
+        $timestamp = Get-Date -Format HH:mm:ss
+        Write-DebugText($timestamp)
+        Write-Text('')
+        Write-ColorText('Apparently the computer crashed in the last run while testing core ' + $CoreFromAutoMode) Red
+        Write-ColorText('Trying to resume the test process') Red
+
+
+        # The last resume attempts couldn't test a single core anymore, nor could they increase a single value (e.g.
+        # because the crashed core has already reached the maximum value, in which case there is no safer value left
+        # that we would be allowed to apply)
+        # Applying the stored values once more would only lead to the next crash and the next reboot, so we stop here
+        # The Scheduled Task and the .automode file are removed by the finally block
+        if ($autoModeResumeAttempts -gt $maxResumeAttemptsWithoutProgress) {
+            Write-Text('')
+            Write-ColorText('The test process has now been resumed ' + $autoModeResumeAttempts + ' times in a row without being able to test a single core!') Red
+            Write-ColorText('The computer apparently already crashes with the stored ' + $modeDescription + ' values before the test can even start.') Red
+            Write-ColorText('Aborting, so that it doesn''t keep rebooting forever.') Red
+            Write-Text('')
+            Write-ColorText('You may want to select a less aggressive "maxValue" setting, or set a stable value for the') Yellow
+            Write-ColorText('affected core(s) in your BIOS.') Yellow
+
+            Exit-Script -errorCode 7
+        }
+
+
+        # The Windows Event Log Source is only added further down in the startup process, but the adjustment below
+        # can already produce Event Log entries (e.g. "core_co_unstable"), which would be skipped without it
+        if ($settings.Logging.useWindowsEventLog -and (Test-EventLogService)) {
+            Add-AppEventLogSource
+        }
+
+
+        # The core already had a final value before the crash, so the crash cannot have been caused by it
+        if (Test-CoreIsResolved $CoreFromAutoMode) {
+            Write-ColorText('Core ' + $CoreFromAutoMode + ' already had a final value before the crash, the crash cannot be attributed to it') Yellow
+            Write-ColorText('Continuing with the remaining cores') Yellow
+        }
+        else {
+            Write-VerboseText('Adjusting the ' + $modeDescription + ' voltage value')
+
+            # We need to pass empty values at this point, as we're only adjusting the starting values
+            $params = @{
+                'mode'             = 'RESUME'
+                'actualCoreNumber' = $CoreFromAutoMode
+            }
+
+            Test-AutomaticTestModeIncrease @params
+        }
+
+
+        # Store the state of this resume attempt before any value is applied to the processor
+        # If we crash while applying them, the increased value resp. the increased resume counter is already on the disk,
+        # otherwise a value that crashes the machine before the first core can be started would be re-applied on every
+        # single reboot, without the counter above ever moving forward
+        Save-AutoModeState
     }
 
 
@@ -5740,6 +6927,12 @@ function Set-CurveOptimizerValues {
                 if ($i -eq $Script:currentlyTestedCore) {
                     $voltageValuesToUse += [Int] $voltageCurrentValues[$i]
                 }
+
+                # If the setting is enabled, cores with an already confirmed value keep that value
+                elseif ($applyConfirmedValuesForNotTestedCores -and $useAutomaticTestMode -and $coreStates.ContainsKey($i) -and $coreStates[$i]['status'] -eq 'confirmed') {
+                    $voltageValuesToUse += [Int] $voltageCurrentValues[$i]
+                }
+
                 else {
                     # We may have allowed higher values than 0
                     $voltageValuesToUse += [Math]::Max($voltageValueForNotTestedCores, $voltageCurrentValues[$i])
@@ -10550,16 +11743,20 @@ function Test-AutomaticTestModeIncrease {
         if ($oldValue -ge $maxValue) {
             Write-ColorText('Cannot increase the ' + $autoModeDescription + ' value for core ' + $actualCoreNumber + ' anymore! The maximum of ' + $maxValueStr + ' has been ' + $reachedOrExceeded) DarkYellow
 
-            [Void] $Script:coresWithIncreasedVoltageValue.Add($actualCoreNumber)
-            [Void] $Script:coresWithErrorAndMaxVoltageValue.Add($actualCoreNumber)
-
-            if ($settings.General.skipCoreOnError) {
-                Write-ColorText('This core will now be skipped in the following iterations') Yellow
+            if ($Script:coresWithIncreasedVoltageValue -notcontains $actualCoreNumber) {
+                [Void] $Script:coresWithIncreasedVoltageValue.Add($actualCoreNumber)
             }
+
+            # This core cannot be stabilized anymore, it will not be tested again
+            Reset-CorePasses -coreNumber $actualCoreNumber -CountError
+            Set-CoreState -coreNumber $actualCoreNumber -status 'unstable' -value $oldValue -reason 'maxValue'
         }
         else {
             $Script:voltageCurrentValues[$actualCoreNumber] = $newValue
-            [Void] $Script:coresWithIncreasedVoltageValue.Add($actualCoreNumber)
+
+            if ($Script:coresWithIncreasedVoltageValue -notcontains $actualCoreNumber) {
+                [Void] $Script:coresWithIncreasedVoltageValue.Add($actualCoreNumber)
+            }
 
             # The current Intel implementation only works with a single voltage offset, not per core
             if ($useIntelVoltageAdjustment) {
@@ -10574,10 +11771,38 @@ function Test-AutomaticTestModeIncrease {
                 Write-ColorText('This is the maximum set ' + $autoModeDescription + ' value, there will be no further increases') Yellow
             }
 
-            # Apply the new values
-            Set-NewVoltageValues
+            if ($canUseWindowsEventLog) {
+                Write-AppEventLog -type $logType -infoString1 $actualCoreNumber -infoString2 $oldValue -infoString3 $newValue
+            }
 
-            Write-AppEventLog -type $logType -infoString1 $actualCoreNumber -infoString2 $oldValue -infoString3 $newValue
+
+            # The value for this core has changed, so it needs to collect its error free test runs from scratch again
+            Reset-CorePasses -coreNumber $actualCoreNumber -CountError
+
+            # For Intel the single voltage offset applies to all of the cores, so no core can keep its collected passes
+            if ($useIntelVoltageAdjustment) {
+                for ($i = 0; $i -lt $Script:voltageCurrentValues.Count; $i++) {
+                    if ($i -ne $actualCoreNumber) {
+                        Reset-CorePasses -coreNumber $i
+                    }
+                }
+            }
+
+            $resultLine  = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  Core ' + $actualCoreNumber.ToString().PadLeft(3, ' ') + '  ' + 'ERROR'.PadRight(9, ' ')
+            $resultLine += '  ' + $(if ($useCurveOptimizer) { 'CO' } else { 'mV' }) + ' ' + $oldValue.ToString().PadLeft(5, ' ') + ' -> ' + $newValue.ToString()
+            $resultLine += '   (error ' + $(if ($coreStates.ContainsKey($actualCoreNumber)) { $coreStates[$actualCoreNumber]['errors'] } else { 0 }) + ', pass counter reset)'
+
+            Write-AutoModeResultEntry -text $resultLine -NoLogEntry
+
+            # The value for this core has actually been changed, so a resume that got us here has made progress
+            $Script:autoModeResumeAttempts = 0
+
+            Set-CoreState -coreNumber $actualCoreNumber -status 'testing' -value $newValue
+
+            # Apply the new values
+            # This happens only after the new value has been stored, so that a crash while it is being applied cannot
+            # make the script set the same crashing value again after the resume
+            Set-NewVoltageValues
         }
 
 
@@ -10637,6 +11862,27 @@ function Get-NewLogfileEntries {
     if (!$resultFileHandle) {
         Write-DebugText('           The stress test log file doesn''t exist yet')
         return
+    }
+
+    # The log file has become smaller than before, so it must have been re-created or truncated
+    # If we don't reset our stored positions here, we would never look at this file again, and so no passed
+    # test would ever be detected anymore
+    if ($null -ne $previousFileSize -and $resultFileHandle.Length -lt $previousFileSize) {
+        Write-DebugText('           The stress test log file has become smaller, it seems to have been re-created')
+        Write-DebugText('           Resetting the stored file positions')
+
+        $Script:previousFileSize        = 0
+        $Script:lastFilePosition        = 0
+        $Script:lineCounter             = 0
+        $Script:previousPassedFFTEntry  = $null
+        $Script:previousPassedFFTSize   = $null
+        $Script:previousPassedTestEntry = $null
+        $Script:previousPassedTest      = $null
+
+        # The stored FFT lines are also gone with the old file, and their line numbers are being re-used by the new one
+        # If we kept them, a line of the new log could be matched against a line of the old one and so be seen as the
+        # second entry of a "pair" for two threads, counting a passed FFT size that only one worker has completed
+        $Script:allFFTLogEntries = [System.Collections.ArrayList]::new()
     }
 
     # Only perform the check if the file size has increased
@@ -11331,6 +12577,21 @@ function Write-AppEventLog {
             'eventId'   = 5000
             'entryType' = 'Information'
             'message'   = [String]::Format('Increasing voltage offset value from {1} to {2} (error on core {0})', $infoString1, $infoString2, $infoString3)
+        }
+        'core_co_known'     = @{
+            'eventId'   = 5050
+            'entryType' = 'Information'
+            'message'   = [String]::Format('Core {0}: using the value {1} provided in the config file', $infoString1, $infoString2)
+        }
+        'core_co_confirmed' = @{
+            'eventId'   = 5100
+            'entryType' = 'Information'
+            'message'   = [String]::Format('Core {0}: the value {1} has been confirmed ({2})', $infoString1, $infoString2, $infoString3)
+        }
+        'core_co_unstable'  = @{
+            'eventId'   = 5200
+            'entryType' = 'Warning'
+            'message'   = [String]::Format('Core {0}: no stable value could be found (last value {1}, reason: {2})', $infoString1, $infoString2, $infoString3)
         }
         'core_whea'         = @{
             'eventId'   = 8888
@@ -13000,7 +14261,10 @@ try {
 
 
     # Always remove the .automode file at this point, we don't want it to interfere
-    Remove-AutoModeFile
+    # But not when we're resuming after a crash, we'd lose the last valid state until the first core has been started
+    if (!$useAutomaticTestModeWithResume -or $CoreFromAutoMode -lt 0) {
+        Remove-AutoModeFile
+    }
 
 
 
@@ -13058,7 +14322,7 @@ try {
     Write-SettingIntroText -Text 'Suspend periodically'                   -Setting ($(if ($settings.General.suspendPeriodically) { 'ENABLED' } else { 'DISABLED' }))
     Write-SettingIntroText -Text 'Restart for each core'                  -Setting ($(if ($settings.General.restartTestProgramForEachCore) { 'ENABLED' } else { 'DISABLED' }))
     Write-SettingIntroText -Text 'Test order of cores'                    -Setting ($settings.General.coreTestOrder.ToUpperInvariant() + $(if ($settings.General.coreTestOrder.ToLowerInvariant() -eq 'default') { ' (' + $coreTestOrderMode.ToUpperInvariant() + ')' }))
-    Write-SettingIntroText -Text 'Number of iterations'                   -Setting ($settings.General.maxIterations)
+    Write-SettingIntroText -Text 'Number of iterations'                   -Setting ($settings.General.maxIterations.ToString() + $(if ($useAutomaticTestMode) { ' (not used in Automatic Test Mode)' }))
 
 
     # Print a message if we're ignoring certain cores
@@ -13081,9 +14345,16 @@ try {
             Write-SettingIntroText -Text 'Starting Curve Optimizer values'      -Setting ($voltageStartingValues -Join ', ')
         }
 
+        Write-SettingIntroText -Text 'Passes to confirm a value'            -Setting ($passesToConfirmCoreValue)
+
+        if ($knownGoodValues.Count -gt 0) {
+            Write-SettingIntroText -Text 'Known good values (not tested)'    -Setting (Get-ConfirmedValuesString -OnlyFromConfig)
+        }
+
         if ($useCurveOptimizer -and $setVoltageOnlyForTestedCore) {
             Write-SettingIntroText -Text 'Set voltage only for the tested core' -Setting ('ENABLED')
             Write-SettingIntroText -Text 'The voltage for the untested cores'   -Setting ($voltageValueForNotTestedCores)
+            Write-SettingIntroText -Text 'Apply confirmed values to other cores' -Setting ($(if ($applyConfirmedValuesForNotTestedCores) { 'ENABLED' } else { 'DISABLED' }))
         }
 
         if ($useIntelVoltageAdjustment) {
@@ -13119,6 +14390,10 @@ try {
 
     if ($stressTestLogFileName) {
         Write-ColorText((' - ' + $stressTestPrograms[$settings.General.stressTestProgram]['displayName'] + ':').PadRight($leftStringLength, ' ') + $stressTestLogFileName) Cyan
+    }
+
+    if ($useAutomaticTestMode -and $autoModeResultsFileName) {
+        Write-ColorText((' - Auto Mode:').PadRight($leftStringLength, ' ') + $autoModeResultsFileName) Cyan
     }
 
     Write-ColorText('────────────────────────────────────────────────────────────────────────────────') Cyan
@@ -13315,6 +14590,10 @@ try {
             $infoString += $logFilePathAbsolute + $stressTestLogFileName + [Environment]::NewLine
         }
 
+        if ($useAutomaticTestMode -and $autoModeResultsFileName) {
+            $infoString += $logFilePathAbsolute + $autoModeResultsFileName + [Environment]::NewLine
+        }
+
         $infoString += [Environment]::NewLine
         $infoString += ('Stress test program: ' + $selectedStressTestProgram.ToUpperInvariant() + [Environment]::NewLine)
         $infoString += ('Selected test mode: ' + $settings.mode.ToUpperInvariant() + [Environment]::NewLine)
@@ -13389,29 +14668,21 @@ try {
     # Remove ignored cores
     [System.Collections.ArrayList] $coresToTest = @($coresToTest | Where-Object { $_ -NotIn $settings.General.coresToIgnore })
 
-
-    # Add the previously tested core from before the reboot if we're in Automatic Test Mode with resume
-    if ($useAutomaticTestModeWithResume -and $CoreFromAutoMode -gt -1) {
-        $timestamp = Get-Date -Format HH:mm:ss
-        Write-DebugText($timestamp)
-        Write-Text('')
-        Write-ColorText('Apparently the computer crashed in the last run while testing core ' + $CoreFromAutoMode) Red
-        Write-ColorText('Trying to resume the test process') Red
-
-        Write-VerboseText('Adding core ' + $CoreFromAutoMode + ' to the front of the test array')
-        [Void] $coresToTest.Insert(0, $CoreFromAutoMode)
-
-        $modeDescription = $(if ($useCurveOptimizer) { 'Curve Optimizer' } else { 'voltage offset' })
-        Write-VerboseText('Adjusting the ' + $modeDescription + ' voltage value')
-
-        # We need to pass empty values at this point, as we're only adjusting the starting values
-        $params = @{
-            'mode'             = 'RESUME'
-            'actualCoreNumber' = $CoreFromAutoMode
-        }
-
-        Test-AutomaticTestModeIncrease @params
+    # There needs to be at least one core to test in the first place
+    # Otherwise we would report a finished run in Automatic Test Mode without having tested anything at all
+    if (@($coresToTest).Count -lt 1) {
+        Exit-WithFatalError('No valid core to test selected!')
     }
+
+    # Remove the cores that already have a final Curve Optimizer / voltage offset value
+    if ($useAutomaticTestMode) {
+        [System.Collections.ArrayList] $coresToTest = @($coresToTest | Where-Object { !(Test-CoreIsResolved ([Int] $_)) })
+    }
+
+
+    # Note: The value of the previously tested core from before the reboot has already been adjusted in
+    # Initialize-AutomaticTestMode, it needs to happen before any value is applied to the processor
+    # The core itself is put back to the front of the test order via the persisted remaining test order (see #106)
 
     Write-VerboseText('All cores that could be tested:')
     Write-VerboseText($allCores -Join ', ')
@@ -13421,18 +14692,19 @@ try {
 
     # Start with the CPU test
     # Repeat the whole check $settings.General.maxIterations times
-    for ($iteration = 1; $iteration -le $settings.General.maxIterations; $iteration++) {
+    # In Automatic Test Mode we ignore maxIterations and instead run until every core has a final value
+    for ($iteration = $resumedIteration; $useAutomaticTestMode -or $iteration -le $settings.General.maxIterations; $iteration++) {
         $timestamp = Get-Date -Format HH:mm:ss
 
         # Define the available cores
         [System.Collections.ArrayList] $coreTestOrderArray = $coresToTest.Clone()
 
-        $halfCores               = $numPhysCores / 2
+        # For an odd number of physical cores the first half is one core larger, so that all of the cores are covered
+        $halfCores               = [Int] [Math]::Ceiling($numPhysCores / 2)
         $numAvailableCores       = $coreTestOrderArray.Count
         $numUniqueAvailableCores = @($coreTestOrderArray | Sort-Object | Get-Unique).Count
         $numCoresWithError       = $coresWithError.Count
         $numCoresWithWheaError   = $coresWithWheaError.Count
-        $previousCoreNumber      = $null
 
 
         # Check if all of the cores have thrown an error, and if so, abort
@@ -13447,14 +14719,15 @@ try {
         }
 
 
-        # Show a different error message if we're using Automatic Test Mode and all cores have reached their maximum value
-        if ($useAutomaticTestMode -and $numCoresWithErrorAndMaxVoltageValue -gt 0 -and $numCoresWithErrorAndMaxVoltageValue -eq $numUniqueAvailableCores) {
-            Close-StressTestProgram
+        # In Automatic Test Mode, check if there is anything left to do at all
+        # A core that has found a good value or that couldn't be stabilized at all doesn't need to be tested anymore
+        if ($useAutomaticTestMode) {
+            $unresolvedCores = @(@($coresToTest | Sort-Object -Unique) | Where-Object { !(Test-CoreIsResolved ([Int] $_)) })
 
-            $autoModeDescription = $(if ($useCurveOptimizer) { 'Curve Optimizer' } elseif ($useIntelVoltageAdjustment) { 'voltage offset' })
-
-            Write-ColorText($timestamp + ' - All Cores have reached the maximum ' + $autoModeDescription + ' value and thrown an error, aborting!') Yellow
-            Exit-Script -errorCode 5
+            if ($unresolvedCores.Count -lt 1) {
+                Write-VerboseText('All cores have a final value, ending the test process')
+                break
+            }
         }
 
 
@@ -13487,30 +14760,18 @@ try {
             # Start fresh
             $coreTestOrderArray = [System.Collections.ArrayList]::new()
 
-            # If we had added a core from CoreFromAutoMode, we will need to push it to the front here again
-            if ($useAutomaticTestModeWithResume -and $CoreFromAutoMode -gt -1) {
-                [Void] $coreTestOrderArray.Add($CoreFromAutoMode)
-            }
-
             # 0, $halfCores, 0+1, $halfCores+1, ...
+            # With an odd number of physical cores the second half has one core less, so the last entry doesn't exist
             # TODO: Maybe find a better way to handle ignored cores, so that there's still an alternation, instead of just skipping it
-            for ($i = 0; $i -lt $numPhysCores; $i++) {
-                $currentCoreNumber = 0
-
-                if ($null -ne $previousCoreNumber) {
-                    if ($previousCoreNumber -lt $halfCores) {
-                        $currentCoreNumber = [Int] ($previousCoreNumber + $halfCores)
+            for ($i = 0; $i -lt $halfCores; $i++) {
+                foreach ($currentCoreNumber in @($i, ($i + $halfCores))) {
+                    if ($currentCoreNumber -gt ($numPhysCores-1)) {
+                        continue
                     }
-                    else {
-                        $currentCoreNumber = [Int] ($previousCoreNumber - $halfCores + 1)
+
+                    if (!$settings.General.coresToIgnore.Contains($currentCoreNumber)) {
+                        [Void] $coreTestOrderArray.Add($currentCoreNumber)
                     }
-                }
-
-                $previousCoreNumber = $currentCoreNumber
-
-
-                if (!$settings.General.coresToIgnore.Contains($currentCoreNumber)) {
-                    [Void] $coreTestOrderArray.Add($currentCoreNumber)
                 }
             }
         }
@@ -13524,29 +14785,6 @@ try {
 
             Write-DebugText('The randomized test order:')
             Write-DebugText($coreTestOrderArray -Join ', ')
-
-            # If we had added a core from CoreFromAutoMode, push that core to the front
-            if ($useAutomaticTestModeWithResume -and $CoreFromAutoMode -gt -1) {
-                Write-VerboseText('Moving the passed core to the beginning of the test order')
-
-                [System.Collections.ArrayList] $coreTestOrderArrayOri = $coreTestOrderArray.Clone()
-                [System.Collections.ArrayList] $coreTestOrderArray = @()
-
-                $coreTestOrderArrayOri | ForEach-Object {
-                    if ([Int] $_ -eq [Int] $CoreFromAutoMode) {
-                        [Void] $coreTestOrderArray.Insert(0, [Int] $_)
-                    }
-                    else {
-                        [Void] $coreTestOrderArray.Add([Int] $_)
-                    }
-                }
-
-                $numAvailableCores       = $coreTestOrderArray.Count
-                $numUniqueAvailableCores = @($coreTestOrderArray | Sort-Object | Get-Unique).Count
-
-                Write-VerboseText('The test order with the core moved to the front:')
-                Write-VerboseText($coreTestOrderArray -Join ', ')
-            }
         }
 
         # Go through core combinations
@@ -13574,18 +14812,6 @@ try {
                 }
             }
 
-            # If we had added a core from CoreFromAutoMode, push that core to the front
-            # Eventually this should be the pair that crashed, but currently we only support single cores
-            # TODO for a future revision
-            if ($useAutomaticTestModeWithResume -and $CoreFromAutoMode -gt -1) {
-                Write-VerboseText('Moving the passed core to the beginning of the test order')
-                Write-DebugText('Eventually this should be the core pair that failed, but we don''t support that yet')
-                [Void] $coreTestOrderArray.Insert(0, [Int] $_)
-            }
-
-            $numAvailableCores       = $coreTestOrderArray.Count
-            $numUniqueAvailableCores = @($coreTestOrderArray | Sort-Object | Get-Unique).Count
-
             Write-DebugText('The core pairs test order:')
             Write-DebugText($coreTestOrderArray -Join ', ')
         }
@@ -13604,6 +14830,40 @@ try {
             # It also already doesn't include the ignored cores
         }
 
+        # Automatic Test Mode: continue where we left off before a crash and skip the cores with a final value
+        if ($useAutomaticTestMode) {
+            # Continue with the not yet tested cores of the interrupted iteration (see #106)
+            if ($useResumedCoreOrder) {
+                # The number of cores may have changed since the crash (e.g. a CCD was disabled in the BIOS), and some
+                # of the cores may have gotten a final value in the meantime, so only keep the ones we can still test
+                $restoredCoreOrder = @(@($resumedCoreOrder) | ForEach-Object { [Int] $_ } | Where-Object { $coreStates.ContainsKey($_) -and !(Test-CoreIsResolved $_) })
+
+                if ($restoredCoreOrder.Count -gt 0) {
+                    Write-VerboseText('Resuming the interrupted test order from before the crash')
+                    [System.Collections.ArrayList] $coreTestOrderArray = $restoredCoreOrder
+                }
+                else {
+                    # The crash happened on the last core of the iteration, just use the regular test order
+                    Write-VerboseText('The stored remaining test order was empty, using the regular test order')
+                }
+
+                $useResumedCoreOrder = $false
+                $resumedCoreOrder    = @()
+            }
+
+            # Cores with a final Curve Optimizer / voltage offset value are never tested again
+            [System.Collections.ArrayList] $coreTestOrderArray = @(@($coreTestOrderArray) | Where-Object { !(Test-CoreIsResolved ([Int] $_)) })
+
+            Write-VerboseText('Cores with a final value (skipped): ' + ((@($coreStates.Keys) | Where-Object { Test-CoreIsResolved ([Int] $_) } | Sort-Object) -Join ', '))
+        }
+
+
+        # The core order builders above may have changed the array, so (re)calculate the counts here, once, for every mode
+        $numAvailableCores                   = @($coreTestOrderArray).Count
+        $numUniqueAvailableCores             = @(@($coreTestOrderArray) | Sort-Object | Get-Unique).Count
+        $numCoresWithErrorAndMaxVoltageValue = @(@($coresWithErrorAndMaxVoltageValue) | Sort-Object | Get-Unique).Count
+
+
         Write-VerboseText('The final test order:')
         Write-VerboseText($coreTestOrderArray -Join ', ')
 
@@ -13611,8 +14871,11 @@ try {
         Write-DebugText('The number of unique available cores:  ' + $numUniqueAvailableCores)
         Write-DebugText('The number of cores with an error:     ' + $numCoresWithError)
         Write-DebugText('The number of cores with a WHEA error: ' + $numCoresWithWheaError)
+        Write-DebugText('The number of cores at the max value:  ' + $numCoresWithErrorAndMaxVoltageValue)
 
 
+        # In Automatic Test Mode the cores that still have to be tested have already been checked above, so if the
+        # built test order is empty at this point, the selected test order cannot cover them at all
         if (@($coreTestOrderArray).Count -lt 1) {
             Exit-WithFatalError('No valid core to test selected!')
         }
@@ -13754,9 +15017,26 @@ try {
             }
 
 
-            # Also skip this core if the maximum Curve Optimizer / voltage offset value has been reached
-            if ($useAutomaticTestMode -and $settings.General.skipCoreOnError -and $coresWithErrorAndMaxVoltageValue -contains $actualCoreNumber) {
-                Write-Text($timestamp + ' - Core ' + $actualCoreNumber + ' (CPU ' + $cpuNumberString + ') has reached the maximum value and has previously thrown an error, skipping')
+            # Also skip this core if it already has a final Curve Optimizer / voltage offset value
+            # A core can become "resolved" after the test order for this iteration has been built, so we need to check this here as well
+            if ($useAutomaticTestMode -and (Test-CoreIsResolved $actualCoreNumber)) {
+                $autoModeDescription = $(if ($useCurveOptimizer) { 'Curve Optimizer' } else { 'voltage offset' })
+                $thisCoreState       = $coreStates[$actualCoreNumber]
+                $skipReason          = ''
+
+                if ($thisCoreState['status'] -eq 'confirmed') {
+                    $skipReason  = 'already has a final ' + $autoModeDescription + ' value of ' + $thisCoreState['value']
+                    $skipReason += $(if ($thisCoreState['source'] -eq 'config') { ' (provided in the config file)' })
+                    $skipReason += ', skipping'
+                }
+                elseif ($thisCoreState['status'] -eq 'unstable') {
+                    $skipReason = 'could not be stabilized (' + $(if ($thisCoreState['reason'] -eq 'maxValue') { 'the maximum value was reached' } else { 'the internal safety limit was reached' }) + '), skipping'
+                }
+                else {
+                    $skipReason = 'is being ignored, skipping'
+                }
+
+                Write-Text($timestamp + ' - Core ' + $actualCoreNumber + ' (CPU ' + $cpuNumberString + ') ' + $skipReason)
 
                 # Remove this core from the array of still available cores
                 [Void] $coreTestOrderArray.RemoveAt(0)
@@ -13788,6 +15068,12 @@ try {
                     Write-ColorText('           Therefore we''re skipping this core.') Black Yellow
 
                     Write-VerboseText('Skipping this core due to Aida64 not running correctly on Core 0 / CPU 0 and Hyperthreading / SMT is disabled')
+
+                    # This core can never be tested, so in Automatic Test Mode we must not wait for a result for it,
+                    # otherwise the test process would never end
+                    if ($useAutomaticTestMode) {
+                        Set-CoreState -coreNumber $actualCoreNumber -status 'ignored'
+                    }
 
                     # Remove this core from the array of still available cores
                     [Void] $coreTestOrderArray.RemoveAt(0)
@@ -13858,6 +15144,22 @@ try {
             [Void] $coreTestOrderArray.RemoveAt(0)
 
 
+            # Automatic Test Mode: count the test runs for this core and check the internal safety limit
+            # This should never trigger, it only exists so that a single core cannot be tested indefinitely
+            if ($useAutomaticTestMode -and $coreStates.ContainsKey($actualCoreNumber)) {
+                $coreStates[$actualCoreNumber]['tests']++
+
+                if ($coreStates[$actualCoreNumber]['tests'] -gt $maxTestsPerCoreSanityLimit) {
+                    Write-ColorText($timestamp + ' - Core ' + $actualCoreNumber + ' has been tested ' + $coreStates[$actualCoreNumber]['tests'] + ' times without a result, this exceeds the internal safety limit of ' + $maxTestsPerCoreSanityLimit) Red
+
+                    Set-CoreState -coreNumber $actualCoreNumber -status 'unstable' -reason 'sanityLimit'
+                    continue
+                }
+
+                Set-CoreState -coreNumber $actualCoreNumber -status 'testing'
+            }
+
+
             # This core has not thrown an error yet, run the test
             $startCoreDate = Get-Date
             $timestamp = $startCoreDate.ToString('HH:mm:ss')
@@ -13876,8 +15178,11 @@ try {
 
 
             # Set the .automode file if we're in Automatic Test Mode with resuming
+            # This flags this core as the one that is now being tested, and it has to happen before its (aggressive)
+            # value is applied to the CPU further below, otherwise a crash would be attributed to the previous core
+            # We also store the remaining test order, so that we can continue where we left off after a crash (see #106)
             if ($useAutomaticTestModeWithResume) {
-                Set-AutoModeFile $actualCoreNumber
+                Save-AutoModeState -coreNumber $actualCoreNumber -iterationNumber $iteration -remainingCoreOrder (@($actualCoreNumber) + @($coreTestOrderArray))
             }
 
 
@@ -14026,7 +15331,16 @@ try {
             $totalRuntimeArray += ($coreStartDifference.Seconds.ToString().PadLeft(2, '0') + 's')
             $totalRunTimeString = $totalRuntimeArray -Join ' '
 
-            Write-ColorText('           Progress ' + ($coreIndex+1) + '/' + $numAvailableCores + ' | Iteration ' + $iteration + '/' + $settings.General.maxIterations + ' | Runtime ' + $totalRunTimeString) DarkGray
+            # In Automatic Test Mode the maxIterations setting is not used, so display the confirmation progress instead
+            if ($useAutomaticTestMode) {
+                $numConfirmedCores = @(@($coreStates.GetEnumerator()) | Where-Object { $_.Value['status'] -eq 'confirmed' }).Count
+                $passesForThisCore = $coreStates[$actualCoreNumber]['passes']
+
+                Write-ColorText('           Progress ' + ($coreIndex+1) + '/' + $numAvailableCores + ' | Iteration ' + $iteration + ' | Pass ' + ($passesForThisCore+1) + '/' + $passesToConfirmCoreValue + ' | Confirmed ' + $numConfirmedCores + '/' + $numPhysCores + ' | Runtime ' + $totalRunTimeString) DarkGray
+            }
+            else {
+                Write-ColorText('           Progress ' + ($coreIndex+1) + '/' + $numAvailableCores + ' | Iteration ' + $iteration + '/' + $settings.General.maxIterations + ' | Runtime ' + $totalRunTimeString) DarkGray
+            }
             Write-DebugText('The number of cores with an error so far: ' + $numCoresWithError)
 
             if ($settings.General.lookForWheaErrors) {
@@ -14426,6 +15740,11 @@ try {
                                 Write-AppEventLog -type 'core_finished' -infoString1 $coreString -infoString2 ('Test completed in ' + $runTimeStringCore)
                             }
 
+                            # This core has completed a test run without an error
+                            if ($useAutomaticTestMode) {
+                                Add-CorePass $actualCoreNumber
+                            }
+
                             continue LoopCoreRunner
                         }
 
@@ -14659,6 +15978,11 @@ try {
                                 Write-AppEventLog -type 'core_finished' -infoString1 $coreString -infoString2 ('Test completed in ' + $runTimeStringCore)
                             }
 
+                            # This core has completed a test run without an error
+                            if ($useAutomaticTestMode) {
+                                Add-CorePass $actualCoreNumber
+                            }
+
                             continue LoopCoreRunner
                         }
 
@@ -14755,6 +16079,11 @@ try {
             if ($canUseWindowsEventLog) {
                 Write-AppEventLog -type 'core_finished' -infoString1 $coreString -infoString2 ('Test completed in ' + $runTimeStringCore)
             }
+
+            # This core has completed a test run without an error
+            if ($useAutomaticTestMode) {
+                Add-CorePass $actualCoreNumber
+            }
         }   # End: :LoopCoreRunner for ($coreIndex = 0; $coreIndex -lt $numAvailableCores; $coreIndex++)
 
 
@@ -14810,6 +16139,30 @@ try {
         }
 
 
+        # Show which cores already have a final value and which ones are still being tested
+        if ($useAutomaticTestMode) {
+            $resolvedCoresStrings = @()
+            $remainingCoresArray  = @()
+
+            foreach ($entry in @($coreStates.GetEnumerator() | Sort-Object -Property { [Int] $_.Name })) {
+                if ($entry.Value['status'] -eq 'ignored') {
+                    continue
+                }
+
+                if (Test-CoreIsResolved ([Int] $entry.Name)) {
+                    $resolvedCoresStrings += ([Int] $entry.Name).ToString() + ' (' + $entry.Value['value'] + ')'
+                }
+                else {
+                    $remainingCoresArray += ([Int] $entry.Name).ToString()
+                }
+            }
+
+            Write-ColorText('Cores with a final value: ' + $(if ($resolvedCoresStrings.Count -gt 0) { $resolvedCoresStrings -Join ', ' } else { '(none)' })) Cyan
+            Write-ColorText('Remaining cores:          ' + $(if ($remainingCoresArray.Count -gt 0) { $remainingCoresArray -Join ', ' } else { '(none)' })) Cyan
+            Write-Text('')
+        }
+
+
         # Show the starting and current Curve Optimizer values
         if ($useCurveOptimizer -and $numCoresWithIncreasedVoltageValue -gt 0) {
             $coCoresString    = ((0..($numPhysCores-1)) | ForEach-Object { ('C' + $_.ToString()).PadLeft(4, ' ') }) -Join ' |'
@@ -14834,6 +16187,74 @@ try {
 
     # The CoreCycler has finished
     $timestamp = Get-Date -Format HH:mm:ss
+
+    if ($useAutomaticTestMode) {
+        $autoModeDescription = $(if ($useCurveOptimizer) { 'Curve Optimizer' } else { 'voltage offset' })
+
+        # The cores that were selected for this run
+        # A custom test order can limit the run to only some of the cores, in which case we cannot make a statement about the others
+        $coresForThisRun  = @(@(0..($numPhysCores-1)) | Where-Object { $_ -NotIn $settings.General.coresToIgnore })
+        $coresDescription = 'All cores'
+
+        if ($coreTestOrderMode -eq 'custom') {
+            $coresForThisRun  = @(@($coreTestOrderCustom | Sort-Object -Unique) | Where-Object { $_ -NotIn $settings.General.coresToIgnore })
+            $coresDescription = 'All of the selected cores (' + ($coresForThisRun -Join ', ') + ')'
+        }
+
+        # Cores that had to be skipped while the test was already running can never get a value
+        # (e.g. Aida64 on Core 0 with disabled Hyperthreading / SMT), and they are not part of the coresToIgnore setting,
+        # so we cannot report a finished run for them either
+        $skippedCores = @(@($coresForThisRun) | Where-Object { $coreStates.ContainsKey([Int] $_) -and $coreStates[[Int] $_]['status'] -eq 'ignored' })
+
+        if ($skippedCores.Count -gt 0) {
+            $coresForThisRun  = @(@($coresForThisRun) | Where-Object { $skippedCores -NotContains $_ })
+            $coresDescription = 'All of the tested cores (' + ($coresForThisRun -Join ', ') + ')'
+        }
+
+        $confirmedCores         = @(@($coresForThisRun) | Where-Object { $coreStates.ContainsKey([Int] $_) -and $coreStates[[Int] $_]['status'] -eq 'confirmed' })
+        $unstableCores          = @(@($coresForThisRun) | Where-Object { $coreStates.ContainsKey([Int] $_) -and $coreStates[[Int] $_]['status'] -eq 'unstable' })
+        $coresWithoutFinalValue = @(@($coresForThisRun) | Where-Object { !(Test-CoreIsResolved ([Int] $_)) })
+
+        # Only report a completed run if the cores really do have a final value
+        if ($coresForThisRun.Count -lt 1) {
+            Write-ColorText($timestamp + ' - The test process has ended, but not a single core could be tested!') Yellow
+        }
+        elseif ($coresWithoutFinalValue.Count -gt 0) {
+            Write-ColorText($timestamp + ' - The test process has ended, but not all of the cores have a final ' + $autoModeDescription + ' value!') Yellow
+            Write-ColorText('The following cores are still without a final value: ' + ($coresWithoutFinalValue -Join ', ')) Yellow
+        }
+        elseif ($unstableCores.Count -gt 0) {
+            Write-ColorText($timestamp + ' - CoreCycler finished, but ' + $unstableCores.Count + ' core' + $(if ($unstableCores.Count -gt 1) { 's' }) + ' could not be stabilized: ' + ($unstableCores -Join ', ')) Yellow
+        }
+        else {
+            Write-ColorText($timestamp + ' - ' + $coresDescription + ' have a final ' + $autoModeDescription + ' value - CoreCycler finished!') Green
+        }
+
+        if ($skippedCores.Count -gt 0) {
+            Write-ColorText('The following cores had to be skipped during the run and have no ' + $autoModeDescription + ' value: ' + ($skippedCores -Join ', ')) Yellow
+        }
+
+        if ($canUseWindowsEventLog) {
+            Write-AppEventLog -type 'script_finished'
+        }
+
+        Close-StressTestProgram
+
+        # Not a single core could be stabilized
+        if ($confirmedCores.Count -lt 1 -and $unstableCores.Count -gt 0) {
+            Write-ColorText($timestamp + ' - All Cores have reached the maximum ' + $autoModeDescription + ' value and thrown an error, aborting!') Yellow
+            Exit-Script -errorCode 5
+        }
+
+        # This should never happen, the test process only ends when every core has a final value
+        # It also covers the case where not a single core of the test order could be tested at all
+        if ($coresWithoutFinalValue.Count -gt 0 -or $coresForThisRun.Count -lt 1) {
+            Exit-Script -errorCode 6
+        }
+
+        Exit-Script
+    }
+
     Write-ColorText($timestamp + ' - CoreCycler finished!') Green
 
     if ($canUseWindowsEventLog) {
@@ -14919,12 +16340,20 @@ finally {
     }
 
 
+    # Store the found Curve Optimizer / voltage offset values permanently, no matter how the script ended
+    Write-AutoModeResultsFooter
+
+
     if ($canUseWindowsEventLog) {
         $infoString  = 'The log files for this run are stored in:' + [Environment]::NewLine
         $infoString += $logFilePathAbsolute + $logFileName + [Environment]::NewLine
 
         if ($stressTestLogFileName) {
             $infoString += $logFilePathAbsolute + $stressTestPrograms[$settings.General.stressTestProgram]['displayName'] + ': ' + $stressTestLogFileName
+        }
+
+        if ($useAutomaticTestMode -and $autoModeResultsFileName) {
+            $infoString += [Environment]::NewLine + 'Auto Mode: ' + $logFilePathAbsolute + $autoModeResultsFileName
         }
 
         $finalSummary = (Show-FinalSummary -ReturnText)

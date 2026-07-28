@@ -26,6 +26,7 @@ $taskPath          = '\CoreCycler\'
 # This file is in \helpers, our main script is one level above
 $scriptRoot        = Split-Path -Path $PSScriptRoot -Parent
 $autoModeFile      = $scriptRoot + '\.automode'
+$autoModeFileBak   = $scriptRoot + '\.automode-bak'
 $maxTimeLimit      = 12 * 60 * 60
 
 
@@ -219,58 +220,94 @@ try {
 
 
 
-    if (!(Test-Path -LiteralPath $autoModeFile -PathType Leaf)) {
+    if (!(Test-Path -LiteralPath $autoModeFile -PathType Leaf) -and !(Test-Path -LiteralPath $autoModeFileBak -PathType Leaf)) {
         Write-Text('The .automode file does not exist!')
         Write-Text('The file is needed to be able to continue the testing process, aborting.')
         Write-Text('(Looking for: ' + $autoModeFile + ')')
         Write-Text('')
 
         Remove-StartupTask
-        
+
         throw [EndTryBlockException] 'The .automode file does not exist, aborting!'
     }
 
 
 
     # Try to get the info from the .automode file
-    Write-Text('Parsing the .automode file:')
-    Write-Text($autoModeFile)
-    Write-Text('')
+    # There are two generations of the file, so if the current one is broken or missing, we can fall back to the previous one
+    $autoModeInfoFromJson = $null
+    $lastErrorMessage     = 'Could not parse the .automode file!'
 
-    $reader = [System.IO.File]::OpenText($autoModeFile)
-    $autoModeFileContentString = $reader.ReadToEnd().Trim()
-    $reader.Close()
+    foreach ($thisFilePath in @($autoModeFile, $autoModeFileBak)) {
+        if (!(Test-Path -LiteralPath $thisFilePath -PathType Leaf)) {
+            continue
+        }
 
+        Write-Text('Parsing the .automode file:')
+        Write-Text($thisFilePath)
+        Write-Text('')
 
-    try {
-        $autoModeInfoFromJson = ConvertFrom-Json $autoModeFileContentString
-    }
-    catch {
-        throw [AutoModeResumeFailedException] ('Possible file corruption detected, could not parse the .automode file!' + [Environment]::NewLine + 'Reason: ' + $_.Exception.Message)
-    }
+        # Everything that can fail for this generation of the file needs to happen inside this try block,
+        # otherwise we would never get to the backup generation
+        # This includes reading the file itself (e.g. a sharing violation) and all of the casts of the stored values
+        try {
+            $autoModeFileContentString = [System.IO.File]::ReadAllText($thisFilePath).Trim()
 
+            $parsedJson = ConvertFrom-Json $autoModeFileContentString
 
-    # We have some required properties
-    @('fileTimestamp', 'lastCoreTested', 'logFileCoreCycler', 'logFileStressTest', 'voltageValues') | ForEach-Object {
-        if (!($autoModeInfoFromJson -and ($autoModeInfoFromJson | Get-Member $_))) {
-            throw [AutoModeResumeFailedException] ('The .automode file is missing the entry "' + $_ + '"!')
+            # We have some required properties
+            @('fileTimestamp', 'lastCoreTested', 'logFileCoreCycler', 'logFileStressTest', 'voltageValues') | ForEach-Object {
+                if (!($parsedJson -and ($parsedJson | Get-Member $_))) {
+                    throw ('The .automode file is missing the entry "' + $_ + '"!')
+                }
+            }
+
+            # There also needs to be a valid core that was being tested, otherwise we cannot resume anything
+            # CoreCycler would treat an invalid core number as a regular new run and start all over again
+            if ([Int] $parsedJson.lastCoreTested -lt 0) {
+                throw ('The .automode file doesn''t contain a valid tested core ("' + $parsedJson.lastCoreTested + '")!')
+            }
+
+            $fileTimestamp     = [UInt64] $parsedJson.fileTimestamp
+            $lastCoreTested    = [Int] $parsedJson.lastCoreTested
+            $logFileCoreCycler = [String] $parsedJson.logFileCoreCycler
+            $logFileStressTest = [String] $parsedJson.logFileStressTest
+            $voltageValues     = [Array] $parsedJson.voltageValues
+            $waitBeforeResume  = $(if ($parsedJson | Get-Member 'waitBeforeResume') { [Int] $parsedJson.waitBeforeResume } else { 0 })     # Optional
+
+            # Optional entries of the newer file format
+            $schemaVersion     = $(if ($parsedJson | Get-Member 'schemaVersion') { [Int] $parsedJson.schemaVersion } else { 1 })
+            $storedIteration   = $(if ($parsedJson | Get-Member 'iteration') { [Int] $parsedJson.iteration } else { 0 })
+            $remainingCores    = $(if ($parsedJson | Get-Member 'remainingCoreOrder') { @([Array] $parsedJson.remainingCoreOrder) } else { @() })
+
+            $autoModeInfoFromJson = $parsedJson
+            break
+        }
+        catch {
+            $lastErrorMessage = $_.Exception.Message
+            Write-Text('Could not use this file: ' + $lastErrorMessage)
+            Write-Text('')
         }
     }
 
+    if (!$autoModeInfoFromJson) {
+        throw [AutoModeResumeFailedException] ('Possible file corruption detected, could not parse the .automode file!' + [Environment]::NewLine + 'Reason: ' + $lastErrorMessage)
+    }
 
-    $fileTimestamp     = [UInt64] $autoModeInfoFromJson.fileTimestamp
-    $lastCoreTested    = [Int] $autoModeInfoFromJson.lastCoreTested
-    $logFileCoreCycler = [String] $autoModeInfoFromJson.logFileCoreCycler
-    $logFileStressTest = [String] $autoModeInfoFromJson.logFileStressTest
-    $voltageValues     = [Array] $autoModeInfoFromJson.voltageValues
-    $waitBeforeResume  = $(if ($autoModeInfoFromJson -and ($autoModeInfoFromJson | Get-Member 'waitBeforeResume')) { [Int] $autoModeInfoFromJson.waitBeforeResume } else { 0 })     # Optional
-    
+
     Write-Text('Timestamp:           ' + $fileTimestamp)
     Write-Text('Tested Core:         ' + $lastCoreTested)
     Write-Text('Logfile CoreCycler:  ' + $logFileCoreCycler)
     Write-Text('Logfile Stress Test: ' + $logFileStressTest)
     Write-Text('Voltage Settings:    ' + $voltageValues)
     Write-Text('Wait before resume:  ' + $waitBeforeResume)
+    Write-Text('File version:        ' + $schemaVersion)
+
+    if ($schemaVersion -ge 2) {
+        Write-Text('Iteration:           ' + $storedIteration)
+        Write-Text('Remaining cores:     ' + $(if ($remainingCores.Count -gt 0) { $remainingCores -Join ', ' } else { '(none)' }))
+    }
+
     Write-Text('')
 
 
@@ -296,7 +333,7 @@ try {
 
     if ($fileTimestamp -lt $limitTimestamp) {
         $actualTimeDiff = $curTimeStamp - $fileTimestamp
-        throw [AutoModeResumeFailedException] ('The resume timestamp is too long ago (too much time has passed: ' + [Math]::Round($actualTimeDiff / 60 / 60, 1) + ' hours, max: ' + [Math]::Round($limitTime / 60 / 60, 1) + ' hours)')
+        throw [AutoModeResumeFailedException] ('The resume timestamp is too long ago (too much time has passed: ' + [Math]::Round($actualTimeDiff / 60 / 60, 1) + ' hours, max: ' + [Math]::Round($maxTimeLimit / 60 / 60, 1) + ' hours)')
     }
 
 

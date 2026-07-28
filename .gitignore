@@ -1,4 +1,6 @@
 .automode
+.automode-bak
+.automode-temp
 .updatecheck
 config.ini
 multiconfig-*.ini
